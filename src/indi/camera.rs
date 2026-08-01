@@ -46,20 +46,28 @@ impl Camera {
     }
 
     pub async fn start_stream(&self) -> Result<()> {
-        let _ = self
-            .dev
-            .change("CCD_VIDEO_STREAM", vec![("STREAM_ON", true)])
-            .await
-            .map_err(|e| anyhow!("starting video stream: {e:?}"))?;
-        Ok(())
+        self.toggle_stream("STREAM_ON").await
     }
 
     pub async fn stop_stream(&self) -> Result<()> {
-        let _ = self
-            .dev
-            .change("CCD_VIDEO_STREAM", vec![("STREAM_OFF", true)])
+        self.toggle_stream("STREAM_OFF").await
+    }
+
+    /// Fire-and-forget a `CCD_VIDEO_STREAM` switch element (`STREAM_ON`/`STREAM_OFF`).
+    ///
+    /// This deliberately uses `set` (send-and-return) rather than `change` (send-and-wait):
+    /// a running stream holds `CCD_VIDEO_STREAM` in the `Busy` state for as long as it runs,
+    /// so `change` — which waits for the property to leave `Busy` — always times out on
+    /// `STREAM_ON` even though the toggle took effect. Blocking here would also stall the
+    /// worker's command loop for the whole timeout. Frames arriving on CCD1 are the real
+    /// confirmation that the stream is live.
+    async fn toggle_stream(&self, element: &str) -> Result<()> {
+        self.dev
+            .parameter("CCD_VIDEO_STREAM")
             .await
-            .map_err(|e| anyhow!("stopping video stream: {e:?}"))?;
+            .map_err(|e| anyhow!("finding CCD_VIDEO_STREAM: {e:?}"))?
+            .set(vec![(element, true)])
+            .map_err(|e| anyhow!("toggling video stream ({element}): {e:?}"))?;
         Ok(())
     }
 

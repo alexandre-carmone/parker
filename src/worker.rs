@@ -309,13 +309,18 @@ async fn spawn_frame_task(
                             sh.frame_count = seq;
                             if let Some(prev) = last {
                                 let dt = now.duration_since(prev).as_secs_f32();
-                                if dt > 0.0 {
+                                if dt > 0.0 && dt < 1.0 {
                                     let inst = 1.0 / dt;
                                     sh.fps = if sh.fps > 0.0 {
                                         0.9 * sh.fps + 0.1 * inst
                                     } else {
                                         inst
                                     };
+                                } else if dt >= 1.0 {
+                                    // A gap this large means the stream stalled or was just
+                                    // (re)started — drop the stale rate instead of dragging the
+                                    // EMA down with one huge interval.
+                                    sh.fps = 0.0;
                                 }
                             }
                         }
@@ -394,6 +399,9 @@ async fn dispatch(cmd: Command, s: &Session, bus: &Bus) -> Result<()> {
         Command::StopStream => {
             camera(s)?.stop_stream().await?;
             set_streaming(bus, false);
+            if let Ok(mut sh) = bus.shared.lock() {
+                sh.fps = 0.0;
+            }
             bus.log("video stream off");
         }
         Command::SetGain(v) => {
