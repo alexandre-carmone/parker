@@ -1,0 +1,24 @@
+[package]
+name = "solar"
+version = "0.1.0"
+edition = "2021"
+description = "INDI-driven solar/planetary imaging suite: camera, mount, and stream-based guiding"
+
+[dependencies]
+indi = "5"
+# Pin: indi -> fitsrs 0.3.x expects wcs 0.4.1's WCSParams; wcs 0.4.2 added fields
+# that break fitsrs 0.3.4's build. Force the compatible version across the tree.
+wcs = "=0.4.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-stream = "0.1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+eframe = "0.35"
+egui = "0.35"
+arc-swap = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
+[[example]]
+name = "probe"
+path = "examples/probe.rs"
