@@ -65,6 +65,7 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                             sh.camera_sel = s.camera_name.clone();
                             sh.mount_sel = s.mount_name.clone();
                         }
+                        init_sensor_size(&s, &bus).await;
                         if let Some(dev) = s.frame_device() {
                             frame_task = spawn_frame_task(dev, bus.clone(), ctx.clone()).await;
                         }
@@ -104,6 +105,7 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                                 sh.streaming = false;
                                 sh.fps = 0.0;
                             }
+                            init_sensor_size(s, &bus).await;
                             if let Some(dev) = s.frame_device() {
                                 frame_task =
                                     spawn_frame_task(dev, bus.clone(), ctx.clone()).await;
@@ -161,6 +163,23 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
 fn set_conn(bus: &Bus, state: ConnState) {
     if let Ok(mut sh) = bus.shared.lock() {
         sh.conn = state;
+    }
+}
+
+/// Read the bound camera's full sensor size into [`Shared`] and seed the ROI to the full frame.
+/// Best-effort: a camera without `CCD_INFO` just leaves the ROI controls disabled (size 0).
+async fn init_sensor_size(s: &Session, bus: &Bus) {
+    let Some(cam) = s.camera.as_ref() else { return };
+    match cam.sensor_size().await {
+        Ok((w, h)) => {
+            if let Ok(mut sh) = bus.shared.lock() {
+                sh.sensor_w = w;
+                sh.sensor_h = h;
+                sh.roi = (0, 0, w, h);
+            }
+            bus.log(format!("sensor: {w}×{h}"));
+        }
+        Err(e) => bus.log(format!("reading sensor size: {e}")),
     }
 }
 
@@ -411,6 +430,17 @@ async fn dispatch(cmd: Command, s: &Session, bus: &Bus) -> Result<()> {
         }
         Command::Abort => mount(s)?.abort().await?,
         Command::CaptureFrame { dir } => capture(bus, &dir)?,
+        Command::SetRoi { x, y, w, h } => set_roi(s, bus, x, y, w, h).await?,
+        Command::ResetRoi => {
+            let (w, h) = {
+                let sh = bus.shared.lock().unwrap();
+                (sh.sensor_w, sh.sensor_h)
+            };
+            if w == 0 || h == 0 {
+                return Err(anyhow!("sensor size unknown; cannot reset ROI"));
+            }
+            set_roi(s, bus, 0, 0, w, h).await?;
+        }
         // handled in run() (need &mut session / frame_task):
         Command::Connect { .. }
         | Command::Disconnect
@@ -424,6 +454,34 @@ fn set_streaming(bus: &Bus, on: bool) {
     if let Ok(mut sh) = bus.shared.lock() {
         sh.streaming = on;
     }
+}
+
+/// Apply a readout region (ROI) to the camera. Changing `CCD_FRAME` while streaming is
+/// unreliable across drivers, so if a stream is running we stop it, set the frame, and restart
+/// it. The applied region is recorded in [`Shared::roi`].
+async fn set_roi(s: &Session, bus: &Bus, x: u32, y: u32, w: u32, h: u32) -> Result<()> {
+    let cam = camera(s)?;
+    let streaming = bus
+        .shared
+        .lock()
+        .map(|sh| sh.streaming)
+        .unwrap_or(false);
+    if streaming {
+        cam.stop_stream().await?;
+    }
+    let result = cam.set_frame(x, y, w, h).await;
+    if streaming {
+        // Best-effort restart even if the frame change failed, so the stream isn't left off.
+        if let Err(e) = cam.start_stream().await {
+            bus.log(format!("restarting stream after ROI change failed: {e}"));
+        }
+    }
+    result?;
+    if let Ok(mut sh) = bus.shared.lock() {
+        sh.roi = (x, y, w, h);
+    }
+    bus.log(format!("ROI set to {w}×{h} at ({x},{y})"));
+    Ok(())
 }
 
 #[cfg(test)]

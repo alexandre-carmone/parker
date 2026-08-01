@@ -47,6 +47,10 @@ pub enum Command {
     Abort,
     /// Save the current live frame to a timestamped PNG in `dir`.
     CaptureFrame { dir: String },
+    /// Restrict the camera readout to a subframe (ROI) in sensor pixels via `CCD_FRAME`.
+    SetRoi { x: u32, y: u32, w: u32, h: u32 },
+    /// Reset the camera readout to the full sensor.
+    ResetRoi,
 }
 
 /// Coarse connection lifecycle state shown in the UI.
@@ -77,6 +81,11 @@ pub struct Shared {
     pub slew_rate_idx: usize,
     pub tracking: bool,
     pub last_capture: Option<String>,
+    /// Full sensor size in pixels (`CCD_INFO`), 0 until a camera is bound. Bounds the ROI controls.
+    pub sensor_w: u32,
+    pub sensor_h: u32,
+    /// Currently-applied readout region `(x, y, w, h)` in sensor pixels (full sensor by default).
+    pub roi: (u32, u32, u32, u32),
     /// Rolling log (most recent last), capped.
     pub log: VecDeque<String>,
 }
@@ -98,6 +107,9 @@ impl Default for Shared {
             slew_rate_idx: 0,
             tracking: false,
             last_capture: None,
+            sensor_w: 0,
+            sensor_h: 0,
+            roi: (0, 0, 0, 0),
             log: VecDeque::new(),
         }
     }

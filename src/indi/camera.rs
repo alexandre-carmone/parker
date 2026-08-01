@@ -3,6 +3,7 @@
 use anyhow::{anyhow, Result};
 use indi::client::active_device::ActiveDevice;
 use indi::serialization::Sexagesimal;
+use indi::Parameter;
 
 /// Wrapper around the CCD `ActiveDevice` exposing the operations M1 needs.
 pub struct Camera {
@@ -82,5 +83,46 @@ impl Camera {
             .await
             .map_err(|e| anyhow!("setting exposure: {e:?}"))?;
         Ok(())
+    }
+
+    /// Set the CCD readout region (subframe / ROI) via `CCD_FRAME`, in sensor pixels. All four
+    /// elements are sent together so the driver applies a consistent rectangle. Resetting to the
+    /// full sensor is just `set_frame(0, 0, max_x, max_y)` — this driver has no `CCD_FRAME_RESET`.
+    pub async fn set_frame(&self, x: u32, y: u32, w: u32, h: u32) -> Result<()> {
+        let _ = self
+            .dev
+            .change(
+                "CCD_FRAME",
+                vec![
+                    ("X", Sexagesimal::from(x as f64)),
+                    ("Y", Sexagesimal::from(y as f64)),
+                    ("WIDTH", Sexagesimal::from(w as f64)),
+                    ("HEIGHT", Sexagesimal::from(h as f64)),
+                ],
+            )
+            .await
+            .map_err(|e| anyhow!("setting CCD frame: {e:?}"))?;
+        Ok(())
+    }
+
+    /// Read the full sensor size (`CCD_INFO` → `CCD_MAX_X`/`CCD_MAX_Y`) in pixels. Used to bound
+    /// the ROI controls and to reset the subframe to full.
+    pub async fn sensor_size(&self) -> Result<(u32, u32)> {
+        let param = self
+            .dev
+            .get_parameter("CCD_INFO")
+            .await
+            .map_err(|e| anyhow!("getting CCD_INFO: {e:?}"))?;
+        let guard = param.read().await;
+        if let Parameter::NumberVector(nv) = &*guard {
+            let get = |name: &str| -> Option<u32> {
+                nv.values.get(name).map(|n| f64::from(n.value) as u32)
+            };
+            let w = get("CCD_MAX_X").ok_or_else(|| anyhow!("CCD_INFO missing CCD_MAX_X"))?;
+            let h = get("CCD_MAX_Y").ok_or_else(|| anyhow!("CCD_INFO missing CCD_MAX_Y"))?;
+            Ok((w, h))
+        } else {
+            Err(anyhow!("CCD_INFO is not a number vector"))
+        }
     }
 }

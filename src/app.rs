@@ -36,6 +36,18 @@ pub struct App {
     /// Force a texture re-upload when stretch settings change (even without a new frame).
     stretch_dirty: bool,
 
+    /// Pending ROI numeric inputs (sensor pixels): x, y, width, height. Seeded to the full
+    /// sensor once its size is known, and overwritten when the user drags a rectangle.
+    roi_x: i64,
+    roi_y: i64,
+    roi_w: i64,
+    roi_h: i64,
+    /// Sensor size the `roi_*` inputs were last seeded from, so a camera swap (new geometry)
+    /// reseeds them to the new full frame. `(0, 0)` until first seeded.
+    roi_seeded_for: (u32, u32),
+    /// In-progress ROI drag on the live view: (start, current) in screen coordinates.
+    roi_drag: Option<(egui::Pos2, egui::Pos2)>,
+
     // ---- test/automation hooks (driven by env vars) ----
     autoconnect: bool,
     autostream: bool,
@@ -66,6 +78,12 @@ impl App {
             auto_stretch: true,
             display_gain: 1.0,
             stretch_dirty: false,
+            roi_x: 0,
+            roi_y: 0,
+            roi_w: 0,
+            roi_h: 0,
+            roi_seeded_for: (0, 0),
+            roi_drag: None,
             // A screenshot run implies autoconnect + autostream so there is content to show.
             autoconnect: autoconnect || screenshot_path.is_some(),
             autostream: autoconnect || screenshot_path.is_some(),
@@ -131,6 +149,9 @@ struct Snap {
     slew_rate_idx: usize,
     tracking: bool,
     last_capture: Option<String>,
+    sensor_w: u32,
+    sensor_h: u32,
+    roi: (u32, u32, u32, u32),
     log_tail: Vec<String>,
 }
 
@@ -150,6 +171,9 @@ impl App {
             slew_rate_idx: sh.slew_rate_idx,
             tracking: sh.tracking,
             last_capture: sh.last_capture.clone(),
+            sensor_w: sh.sensor_w,
+            sensor_h: sh.sensor_h,
+            roi: sh.roi,
             log_tail: sh.log.iter().rev().take(8).rev().cloned().collect(),
         }
     }
@@ -162,6 +186,17 @@ impl eframe::App for App {
         let snap = self.snapshot();
         self.refresh_texture(&ctx, snap.streaming);
         let connected = snap.conn == ConnState::Connected;
+
+        // Seed the ROI inputs to the full sensor the first time its size is reported, and again
+        // if the sensor geometry changes (e.g. the user selects a different camera).
+        if snap.sensor_w > 0 && (snap.sensor_w, snap.sensor_h) != self.roi_seeded_for {
+            self.roi_seeded_for = (snap.sensor_w, snap.sensor_h);
+            let (x, y, w, h) = snap.roi;
+            self.roi_x = x as i64;
+            self.roi_y = y as i64;
+            self.roi_w = w as i64;
+            self.roi_h = h as i64;
+        }
 
         // ---- Top bar: connection + status ----
         egui::Panel::top("top").show(ui, |ui| {
@@ -266,6 +301,52 @@ impl eframe::App for App {
                 if let Some(path) = &snap.last_capture {
                     ui.small(format!("saved: {path}"));
                 }
+
+                ui.separator();
+                ui.label("Region of interest");
+                ui.add_enabled_ui(snap.sensor_w > 0, |ui| {
+                    let sw = snap.sensor_w.max(1) as f64;
+                    let sh = snap.sensor_h.max(1) as f64;
+                    egui::Grid::new("roi_grid").num_columns(2).show(ui, |ui| {
+                        ui.label("X");
+                        ui.add(egui::DragValue::new(&mut self.roi_x).range(0.0..=sw - 1.0));
+                        ui.end_row();
+                        ui.label("Y");
+                        ui.add(egui::DragValue::new(&mut self.roi_y).range(0.0..=sh - 1.0));
+                        ui.end_row();
+                        ui.label("W");
+                        ui.add(egui::DragValue::new(&mut self.roi_w).range(1.0..=sw));
+                        ui.end_row();
+                        ui.label("H");
+                        ui.add(egui::DragValue::new(&mut self.roi_h).range(1.0..=sh));
+                        ui.end_row();
+                    });
+                    ui.small("Tip: drag a rectangle on the video to set this.");
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply ROI").clicked() {
+                            let (x, y, w, h) = clamp_roi(
+                                self.roi_x,
+                                self.roi_y,
+                                self.roi_w,
+                                self.roi_h,
+                                snap.sensor_w,
+                                snap.sensor_h,
+                            );
+                            self.roi_x = x as i64;
+                            self.roi_y = y as i64;
+                            self.roi_w = w as i64;
+                            self.roi_h = h as i64;
+                            self.send(Command::SetRoi { x, y, w, h });
+                        }
+                        if ui.button("Reset (full)").clicked() {
+                            self.roi_x = 0;
+                            self.roi_y = 0;
+                            self.roi_w = snap.sensor_w as i64;
+                            self.roi_h = snap.sensor_h as i64;
+                            self.send(Command::ResetRoi);
+                        }
+                    });
+                });
             });
 
             ui.separator();
@@ -359,22 +440,65 @@ impl eframe::App for App {
             }
         });
 
-        // ---- Center: live view ----
+        // ---- Center: live view (drag to select an ROI) ----
         egui::CentralPanel::default().show(ui, |ui| {
-            if let Some(tex) = &self.texture {
-                let avail = ui.available_size();
-                let sized = egui::load::SizedTexture::new(tex.id(), tex.size_vec2());
-                ui.centered_and_justified(|ui| {
-                    ui.add(
-                        egui::Image::new(sized)
-                            .max_size(avail)
-                            .maintain_aspect_ratio(true),
-                    );
-                });
-            } else {
+            let Some((tex_id, tex_size)) = self.texture.as_ref().map(|t| (t.id(), t.size_vec2()))
+            else {
                 ui.centered_and_justified(|ui| {
                     ui.label("No video — connect and start the stream.");
                 });
+                return;
+            };
+
+            // Aspect-fit the frame into the available area (what maintain_aspect_ratio did,
+            // but explicit so pointer↔pixel mapping is exact).
+            let image_rect = fit_rect(ui.available_rect_before_wrap(), tex_size);
+            let sized = egui::load::SizedTexture::new(tex_id, tex_size);
+            egui::Image::new(sized).paint_at(ui, image_rect);
+
+            // ROI selection is only meaningful once we know the sensor geometry.
+            if snap.sensor_w > 0 {
+                let resp = ui.interact(image_rect, ui.id().with("roi_sel"), egui::Sense::drag());
+                if resp.drag_started() {
+                    if let Some(p) = resp.interact_pointer_pos() {
+                        self.roi_drag = Some((p, p));
+                    }
+                } else if resp.dragged() {
+                    if let (Some((start, _)), Some(p)) =
+                        (self.roi_drag, resp.interact_pointer_pos())
+                    {
+                        self.roi_drag = Some((start, p));
+                    }
+                } else if resp.drag_stopped() {
+                    if let Some((start, end)) = self.roi_drag.take() {
+                        let sel = egui::Rect::from_two_pos(start, end).intersect(image_rect);
+                        // Ignore an accidental click (near-zero drag).
+                        if sel.width() >= 3.0 && sel.height() >= 3.0 {
+                            let img = [
+                                image_rect.min.x,
+                                image_rect.min.y,
+                                image_rect.width(),
+                                image_rect.height(),
+                            ];
+                            let drag = [sel.min.x, sel.min.y, sel.width(), sel.height()];
+                            let (x, y, w, h) = drag_to_roi(img, drag, snap.roi);
+                            self.roi_x = x as i64;
+                            self.roi_y = y as i64;
+                            self.roi_w = w as i64;
+                            self.roi_h = h as i64;
+                        }
+                    }
+                }
+                // Draw the in-progress selection rectangle.
+                if let Some((start, end)) = self.roi_drag {
+                    let rect = egui::Rect::from_two_pos(start, end).intersect(image_rect);
+                    ui.painter().rect_stroke(
+                        rect,
+                        0.0,
+                        egui::Stroke::new(1.5, egui::Color32::YELLOW),
+                        egui::StrokeKind::Inside,
+                    );
+                }
             }
         });
 
@@ -416,6 +540,59 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
     }
+}
+
+/// Smallest ROI we will command, in sensor pixels (drivers reject degenerate frames).
+const MIN_ROI: i64 = 16;
+
+/// Centered aspect-fit of a texture of `tex_size` within `container` (replaces egui's
+/// `maintain_aspect_ratio`, giving us the exact on-screen image rectangle for hit-testing).
+fn fit_rect(container: egui::Rect, tex_size: egui::Vec2) -> egui::Rect {
+    if tex_size.x <= 0.0 || tex_size.y <= 0.0 {
+        return container;
+    }
+    let scale = (container.width() / tex_size.x)
+        .min(container.height() / tex_size.y)
+        .max(0.0);
+    egui::Rect::from_center_size(container.center(), tex_size * scale)
+}
+
+/// Clamp user-entered ROI numbers to the sensor and enforce a minimum size, in sensor pixels.
+fn clamp_roi(x: i64, y: i64, w: i64, h: i64, sensor_w: u32, sensor_h: u32) -> (u32, u32, u32, u32) {
+    let sw = sensor_w as i64;
+    let sh = sensor_h as i64;
+    let x = x.clamp(0, (sw - 1).max(0));
+    let y = y.clamp(0, (sh - 1).max(0));
+    // Fit within the sensor, but grow up to MIN_ROI where there is room.
+    let w = w.clamp(1, sw - x).max(MIN_ROI.min(sw - x));
+    let h = h.clamp(1, sh - y).max(MIN_ROI.min(sh - y));
+    (x as u32, y as u32, w as u32, h as u32)
+}
+
+/// Map a drag rectangle drawn on the displayed image to a sensor-pixel ROI.
+///
+/// The displayed frame *is* the currently-applied ROI, so we compose: the drag's fractional
+/// position/size within the on-screen image rect is scaled by the current ROI and offset by its
+/// origin. `image` and `drag` are `[min_x, min_y, width, height]` in the same screen coordinates;
+/// `drag` is assumed already clipped to `image`.
+fn drag_to_roi(
+    image: [f32; 4],
+    drag: [f32; 4],
+    current: (u32, u32, u32, u32),
+) -> (u32, u32, u32, u32) {
+    let (cx, cy, cw, ch) = current;
+    if image[2] <= 0.0 || image[3] <= 0.0 || cw == 0 || ch == 0 {
+        return current;
+    }
+    let fx = ((drag[0] - image[0]) / image[2]).clamp(0.0, 1.0);
+    let fy = ((drag[1] - image[1]) / image[3]).clamp(0.0, 1.0);
+    let fw = (drag[2] / image[2]).clamp(0.0, 1.0);
+    let fh = (drag[3] / image[3]).clamp(0.0, 1.0);
+    let x = (cx + (fx * cw as f32).round() as u32).min(cx + cw - 1);
+    let y = (cy + (fy * ch as f32).round() as u32).min(cy + ch - 1);
+    let w = ((fw * cw as f32).round() as u32).clamp(1, cx + cw - x);
+    let h = ((fh * ch as f32).round() as u32).clamp(1, cy + ch - y);
+    (x, y, w, h)
 }
 
 /// Encode an egui screenshot [`ColorImage`] to a PNG file (used by the screenshot hook).
@@ -464,5 +641,45 @@ impl App {
                 handle(ui, 1, Dir::South, DIRS[1].1);
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drag_maps_fraction_of_full_frame() {
+        // Full sensor 100×100 shown at 2× (200×200 on screen). A drag over the middle quarter
+        // → x=25,y=25,w=50,h=50 in sensor pixels.
+        let roi = drag_to_roi([0.0, 0.0, 200.0, 200.0], [50.0, 50.0, 100.0, 100.0], (0, 0, 100, 100));
+        assert_eq!(roi, (25, 25, 50, 50));
+    }
+
+    #[test]
+    fn drag_composes_with_current_roi_origin() {
+        // Already cropped to a region starting at (10,20), size 80×60, shown 1:1. A drag over the
+        // top-left half is offset by the current origin.
+        let roi = drag_to_roi([0.0, 0.0, 80.0, 60.0], [0.0, 0.0, 40.0, 30.0], (10, 20, 80, 60));
+        assert_eq!(roi, (10, 20, 40, 30));
+    }
+
+    #[test]
+    fn drag_stays_inside_current_frame() {
+        // A drag to the far edge can't produce a region extending past the current ROI.
+        let roi = drag_to_roi([0.0, 0.0, 100.0, 100.0], [90.0, 90.0, 20.0, 20.0], (0, 0, 100, 100));
+        assert_eq!(roi, (90, 90, 10, 10));
+    }
+
+    #[test]
+    fn clamp_enforces_minimum_size() {
+        // A 3px request grows to MIN_ROI when there's room.
+        assert_eq!(clamp_roi(0, 0, 3, 3, 100, 100), (0, 0, 16, 16));
+    }
+
+    #[test]
+    fn clamp_fits_within_sensor_at_edge() {
+        // Near the far edge, width/height are capped to what remains (below MIN_ROI is allowed).
+        assert_eq!(clamp_roi(90, 95, 50, 50, 100, 100), (90, 95, 10, 5));
     }
 }
