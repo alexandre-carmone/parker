@@ -16,12 +16,19 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 eframe = "0.35"
 egui = "0.35"
+# egui_plot is versioned one minor ahead of egui: egui_plot 0.36 depends on egui 0.35
+# (egui_plot 0.35 pulls egui 0.34 → a duplicate-egui type mismatch). Keep this offset in sync.
+egui_plot = "0.36"
 arc-swap = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [[example]]
 name = "probe"
 path = "examples/probe.rs"
+
+[[example]]
+name = "guide_check"
+path = "examples/guide_check.rs"
 
 # Live video decoding is numeric-heavy: an unoptimized `image` JPEG decode of an 8 MP frame
 # takes ~3.4 s (0.3 fps), which throttles the stream to a crawl in a plain `cargo run` debug

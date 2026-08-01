@@ -254,6 +254,17 @@ impl Session {
         Ok(())
     }
 
+    /// A second, independent handle to the currently-bound mount device (for the guide loop /
+    /// calibration task, which runs concurrently with the command loop). The device is already
+    /// connected; this just gets another `ActiveDevice` into the same shared device store.
+    pub async fn clone_mount(&self) -> Option<Mount> {
+        if self.mount_name.is_empty() {
+            return None;
+        }
+        let dev = self.client.get_device(&self.mount_name).await.ok()?;
+        Some(Mount::new(dev))
+    }
+
     /// Bind, connect, and switch to a different mount device by name.
     pub async fn select_mount(&mut self, name: &str) -> Result<()> {
         let dev = self

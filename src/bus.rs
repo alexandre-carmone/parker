@@ -9,13 +9,14 @@
 //! - worker -> GUI (state): [`Shared`] behind a std `Mutex`, read each repaint.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwapOption;
 use egui::ColorImage;
 
 use crate::frame::Frame;
+use crate::guiding::{GuideMode, GuideParams, GuideSample};
 
 /// Cardinal nudge directions for manual mount slewing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +52,22 @@ pub enum Command {
     SetRoi { x: u32, y: u32, w: u32, h: u32 },
     /// Reset the camera readout to the full sensor.
     ResetRoi,
+
+    // ---- guiding (M2) ----
+    /// Run the automatic pulse-based calibration (measures the pixel→mount mapping).
+    Calibrate,
+    /// Begin auto-guiding: lock onto the current target and correct drift with pulse-guides.
+    StartGuiding,
+    /// Stop auto-guiding.
+    StopGuiding,
+    /// Re-acquire the lock point (and Surface reference patch) at the current target position.
+    Relock,
+    /// Choose the detection mode (Disk centroid vs. Surface cross-correlation).
+    SetGuideMode(GuideMode),
+    /// Update the live guiding-loop parameters.
+    SetGuideParams(GuideParams),
+    /// Turn per-frame target detection on/off for the on-screen overlay (independent of guiding).
+    SetDetectionOverlay(bool),
 }
 
 /// Coarse connection lifecycle state shown in the UI.
@@ -86,6 +103,33 @@ pub struct Shared {
     pub sensor_h: u32,
     /// Currently-applied readout region `(x, y, w, h)` in sensor pixels (full sensor by default).
     pub roi: (u32, u32, u32, u32),
+
+    // ---- guiding (M2) telemetry, in frame pixels ----
+    /// Whether the guide loop is currently running.
+    pub guiding: bool,
+    /// Whether a calibration run is in progress.
+    pub calibrating: bool,
+    /// Whether a valid calibration has been obtained (required before guiding).
+    pub calibrated: bool,
+    /// The current pixel→mount calibration (present once `calibrated`).
+    pub guide_calib: Option<crate::guiding::Calibration>,
+    /// The locked reference position guiding steers the target back toward.
+    pub lock_point: Option<(f32, f32)>,
+    /// Most recent detected target position (for the on-screen overlay).
+    pub detected: Option<(f32, f32)>,
+    /// Most recent guide error `(dx, dy) = detected − lock_point`.
+    pub guide_err: Option<(f32, f32)>,
+    /// RMS of the recent guide error magnitude (pixels).
+    pub guide_rms: f32,
+    /// Rolling guide-error history `(dx, dy)` for the graph, capped.
+    pub guide_history: VecDeque<(f32, f32)>,
+    /// Live guiding-loop parameters (edited in the UI, read by the guide loop).
+    pub guide_params: GuideParams,
+    /// Current detection mode (mirrors [`Bus::guide_mode`] for the UI).
+    pub guide_mode: GuideMode,
+    /// UI toggle: run detection for the on-screen overlay even when not guiding.
+    pub detect_overlay: bool,
+
     /// Rolling log (most recent last), capped.
     pub log: VecDeque<String>,
 }
@@ -110,6 +154,18 @@ impl Default for Shared {
             sensor_w: 0,
             sensor_h: 0,
             roi: (0, 0, 0, 0),
+            guiding: false,
+            calibrating: false,
+            calibrated: false,
+            guide_calib: None,
+            lock_point: None,
+            detected: None,
+            guide_err: None,
+            guide_rms: 0.0,
+            guide_history: VecDeque::new(),
+            guide_params: GuideParams::default(),
+            guide_mode: GuideMode::Disk,
+            detect_overlay: false,
             log: VecDeque::new(),
         }
     }
@@ -140,6 +196,16 @@ pub struct Bus {
     /// holds an `f32` via its bit pattern.
     pub auto_stretch: Arc<AtomicBool>,
     pub display_gain: Arc<AtomicU32>,
+
+    // ---- guiding (M2), read lock-free by the decode thread / guide loop ----
+    /// Newest target measurement from the detector (latest-wins, like `latest_frame`).
+    pub guide_sample: Arc<ArcSwapOption<GuideSample>>,
+    /// When set, the decode thread runs target detection (guiding, calibrating, or overlay on).
+    pub detect_enabled: Arc<AtomicBool>,
+    /// Detection mode as [`GuideMode::as_u8`], read by the decode-thread detector.
+    pub guide_mode: Arc<AtomicU8>,
+    /// Bumped on guide start / re-lock to make the Surface detector recapture its reference patch.
+    pub ref_generation: Arc<AtomicU64>,
 }
 
 impl Bus {
@@ -151,6 +217,10 @@ impl Bus {
             display_seq: Arc::new(AtomicU64::new(0)),
             auto_stretch: Arc::new(AtomicBool::new(true)),
             display_gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            guide_sample: Arc::new(ArcSwapOption::empty()),
+            detect_enabled: Arc::new(AtomicBool::new(false)),
+            guide_mode: Arc::new(AtomicU8::new(GuideMode::Disk.as_u8())),
+            ref_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -179,6 +249,38 @@ impl Bus {
     pub fn publish_display(&self, img: ColorImage) {
         self.display.store(Some(Arc::new(img)));
         self.display_seq.fetch_add(1, Ordering::Release);
+    }
+
+    /// Recompute whether the decode thread should run detection from the current state:
+    /// on while guiding, calibrating, or the overlay toggle is set. Must NOT be called while
+    /// holding `shared` (it locks it).
+    pub fn refresh_detect(&self) {
+        let on = if let Ok(sh) = self.shared.lock() {
+            sh.detect_overlay || sh.calibrating || sh.guiding
+        } else {
+            false
+        };
+        self.detect_enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether the decode thread should run detection this frame.
+    pub fn detect_enabled(&self) -> bool {
+        self.detect_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Set the detection mode for the decode-thread detector.
+    pub fn set_guide_mode(&self, mode: GuideMode) {
+        self.guide_mode.store(mode.as_u8(), Ordering::Relaxed);
+    }
+
+    /// Signal the Surface detector to recapture its reference patch, returning the new generation.
+    pub fn bump_ref_generation(&self) -> u64 {
+        self.ref_generation.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Decode thread: publish the newest target measurement.
+    pub fn publish_guide_sample(&self, sample: GuideSample) {
+        self.guide_sample.store(Some(Arc::new(sample)));
     }
 }
 

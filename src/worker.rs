@@ -1,8 +1,9 @@
 //! The async INDI worker: owns the connection/session, decodes the video stream into the
 //! shared frame slot, and translates GUI [`Command`]s into INDI property changes.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -14,14 +15,35 @@ use indi::Parameter; // external crate; `crate::indi` is our local module
 
 use crate::bus::{Bus, Command, ConnState};
 use crate::frame::Frame;
+use crate::guiding::{self, GuideDetector, GuideSample};
 use crate::indi::camera::Camera;
 use crate::indi::mount::Mount;
 use crate::indi::Session;
+
+/// The running guide control loop: its task plus a stop flag it polls each cycle. Dropping the
+/// handle alone would leave the task running, so callers must call [`GuideLoop::shutdown`].
+struct GuideLoop {
+    task: JoinHandle<()>,
+    stop: Arc<AtomicBool>,
+}
+
+impl GuideLoop {
+    fn shutdown(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.task.abort();
+    }
+}
+
+/// How often the decode thread runs detection while enabled — enough to feed the few-Hz control
+/// loop and the overlay without doing centroid/NCC work on every high-FPS frame.
+const DETECT_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Entry point for the worker task. Runs until the command channel closes.
 pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Context) {
     let mut session: Option<Session> = None;
     let mut frame_task: Option<FrameStream> = None;
+    let mut guide_loop: Option<GuideLoop> = None;
+    let mut calib_task: Option<JoinHandle<()>> = None;
 
     while let Some(cmd) = rx.recv().await {
         match cmd {
@@ -81,6 +103,7 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                 ctx.request_repaint();
             }
             Command::Disconnect => {
+                stop_guiding(&mut guide_loop, &mut calib_task, &bus);
                 if let Some(fs) = frame_task.take() {
                     fs.shutdown();
                 }
@@ -94,6 +117,7 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                 ctx.request_repaint();
             }
             Command::SelectCamera(name) => {
+                stop_guiding(&mut guide_loop, &mut calib_task, &bus);
                 match session.as_mut() {
                     Some(s) => match s.select_camera(&name).await {
                         Ok(()) => {
@@ -119,6 +143,7 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                 ctx.request_repaint();
             }
             Command::SelectMount(name) => {
+                stop_guiding(&mut guide_loop, &mut calib_task, &bus);
                 match session.as_mut() {
                     Some(s) => match s.select_mount(&name).await {
                         Ok(()) => {
@@ -145,7 +170,55 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                 }
                 ctx.request_repaint();
             }
+            Command::Calibrate => {
+                if calib_task.is_some() {
+                    bus.log("calibration already running");
+                } else if guide_loop.is_some() {
+                    bus.log("stop guiding before calibrating");
+                } else if let Some(s) = &session {
+                    let streaming = bus.shared.lock().map(|sh| sh.streaming).unwrap_or(false);
+                    match (streaming, s.clone_mount().await) {
+                        (false, _) => bus.log("start the stream before calibrating"),
+                        (true, None) => bus.log("no mount selected — cannot calibrate"),
+                        (true, Some(m)) => {
+                            bus.bump_ref_generation(); // fresh Surface reference at frame center
+                            let (b, c) = (bus.clone(), ctx.clone());
+                            calib_task = Some(tokio::spawn(async move {
+                                guiding::run_calibration(m, b, c).await;
+                            }));
+                        }
+                    }
+                } else {
+                    bus.log("not connected");
+                }
+                ctx.request_repaint();
+            }
+            Command::StartGuiding => {
+                if guide_loop.is_some() {
+                    bus.log("already guiding");
+                } else if let Some(s) = &session {
+                    start_guiding(s, &bus, &ctx, &mut guide_loop).await;
+                } else {
+                    bus.log("not connected");
+                }
+                ctx.request_repaint();
+            }
+            Command::StopGuiding => {
+                stop_guiding(&mut guide_loop, &mut calib_task, &bus);
+                bus.log("guiding stopped");
+                ctx.request_repaint();
+            }
             other => {
+                // Safety: stopping the stream or changing the ROI invalidates the lock point /
+                // reference patch, so stop guiding before applying such a command.
+                if matches!(
+                    other,
+                    Command::StopStream | Command::SetRoi { .. } | Command::ResetRoi
+                ) && guide_loop.is_some()
+                {
+                    stop_guiding(&mut guide_loop, &mut calib_task, &bus);
+                    bus.log("guiding stopped (frame changed)");
+                }
                 match &session {
                     Some(s) => {
                         if let Err(e) = dispatch(other, s, &bus).await {
@@ -156,6 +229,85 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                 }
                 ctx.request_repaint();
             }
+        }
+    }
+}
+
+/// Stop any running guide loop and calibration task, and clear the guiding telemetry flags.
+fn stop_guiding(
+    guide_loop: &mut Option<GuideLoop>,
+    calib_task: &mut Option<JoinHandle<()>>,
+    bus: &Bus,
+) {
+    if let Some(g) = guide_loop.take() {
+        g.shutdown();
+    }
+    if let Some(t) = calib_task.take() {
+        t.abort();
+    }
+    if let Ok(mut sh) = bus.shared.lock() {
+        sh.guiding = false;
+        sh.calibrating = false;
+        sh.guide_err = None;
+    }
+    bus.refresh_detect();
+}
+
+/// Begin guiding: require a calibration and a running stream, lock onto the current target
+/// (waiting briefly for a fresh detection), and spawn the guide loop.
+async fn start_guiding(
+    s: &Session,
+    bus: &Bus,
+    ctx: &egui::Context,
+    guide_loop: &mut Option<GuideLoop>,
+) {
+    let (streaming, calibrated) = bus
+        .shared
+        .lock()
+        .map(|sh| (sh.streaming, sh.calibrated))
+        .unwrap_or((false, false));
+    if !streaming {
+        bus.log("start the stream before guiding");
+        return;
+    }
+    if !calibrated {
+        bus.log("calibrate before guiding");
+        return;
+    }
+    let Some(mount) = s.clone_mount().await else {
+        bus.log("no mount selected — cannot guide");
+        return;
+    };
+
+    // Turn on detection and lock onto the current target.
+    if let Ok(mut sh) = bus.shared.lock() {
+        sh.guiding = true;
+    }
+    bus.refresh_detect();
+    bus.bump_ref_generation(); // Surface: recapture the reference at the lock position
+    let base_seq = bus.guide_sample.load_full().map(|s| s.seq).unwrap_or(0);
+    match guiding::next_sample(bus, base_seq, Duration::from_secs(2)).await {
+        Some(sample) => {
+            if let Ok(mut sh) = bus.shared.lock() {
+                sh.lock_point = Some((sample.x, sample.y));
+                sh.guide_err = None;
+                sh.guide_rms = 0.0;
+                sh.guide_history.clear();
+            }
+            let stop = Arc::new(AtomicBool::new(false));
+            let (b, c, st) = (bus.clone(), ctx.clone(), stop.clone());
+            let task = tokio::spawn(async move {
+                guiding::run_guide_loop(mount, b, c, st).await;
+            });
+            *guide_loop = Some(GuideLoop { task, stop });
+            bus.log("guiding started");
+        }
+        None => {
+            if let Ok(mut sh) = bus.shared.lock() {
+                sh.guiding = false;
+            }
+            bus.refresh_detect();
+            bus.log("no target detected — cannot lock");
         }
     }
 }
@@ -300,6 +452,9 @@ async fn spawn_frame_task(
         std::thread::spawn(move || {
             let mut seq: u64 = 0;
             let mut last: Option<Instant> = None;
+            // Guiding detector state persists across frames (holds the Surface reference patch).
+            let mut detector = GuideDetector::default();
+            let mut last_detect: Option<Instant> = None;
             while let Some(raw) = slot.wait() {
                 match Frame::from_stream_blob(raw.format.as_deref(), &raw.data, seq + 1) {
                     Ok(frame) => {
@@ -325,6 +480,24 @@ async fn spawn_frame_task(
                             }
                         }
                         last = Some(now);
+
+                        // Guiding detection (throttled): measure the target position and publish
+                        // it for the guide loop + overlay. Runs only when enabled, and at most
+                        // every DETECT_INTERVAL regardless of frame rate.
+                        if bus.detect_enabled() {
+                            let due = last_detect.is_none_or(|t| now.duration_since(t) >= DETECT_INTERVAL);
+                            if due {
+                                last_detect = Some(now);
+                                let detected = detector.measure(&frame, &bus);
+                                if let Some((x, y)) = detected {
+                                    bus.publish_guide_sample(GuideSample { x, y, seq });
+                                }
+                                if let Ok(mut sh) = bus.shared.lock() {
+                                    sh.detected = detected;
+                                }
+                            }
+                        }
+
                         // Do the display stretch + Color32 conversion here, off the GUI
                         // thread, and publish a ready-to-upload image. Keep the raw frame
                         // for capture.
@@ -438,6 +611,29 @@ async fn dispatch(cmd: Command, s: &Session, bus: &Bus) -> Result<()> {
         }
         Command::Abort => mount(s)?.abort().await?,
         Command::CaptureFrame { dir } => capture(bus, &dir)?,
+        Command::SetGuideMode(mode) => {
+            bus.set_guide_mode(mode);
+            bus.bump_ref_generation(); // Surface: recapture reference under the new mode
+            if let Ok(mut sh) = bus.shared.lock() {
+                sh.guide_mode = mode;
+            }
+            bus.log(format!("guide mode: {mode:?}"));
+        }
+        Command::SetGuideParams(params) => {
+            if let Ok(mut sh) = bus.shared.lock() {
+                sh.guide_params = params;
+            }
+        }
+        Command::SetDetectionOverlay(on) => {
+            if let Ok(mut sh) = bus.shared.lock() {
+                sh.detect_overlay = on;
+                if !on {
+                    sh.detected = None;
+                }
+            }
+            bus.refresh_detect();
+        }
+        Command::Relock => relock(bus).await,
         Command::SetRoi { x, y, w, h } => set_roi(s, bus, x, y, w, h).await?,
         Command::ResetRoi => {
             let (w, h) = {
@@ -449,13 +645,35 @@ async fn dispatch(cmd: Command, s: &Session, bus: &Bus) -> Result<()> {
             }
             set_roi(s, bus, 0, 0, w, h).await?;
         }
-        // handled in run() (need &mut session / frame_task):
+        // handled in run() (need &mut session / task handles):
         Command::Connect { .. }
         | Command::Disconnect
         | Command::SelectCamera(_)
-        | Command::SelectMount(_) => {}
+        | Command::SelectMount(_)
+        | Command::Calibrate
+        | Command::StartGuiding
+        | Command::StopGuiding => {}
     }
     Ok(())
+}
+
+/// Re-acquire the lock point (and Surface reference) at the current target position. Only
+/// meaningful while detection is running (guiding or overlay on).
+async fn relock(bus: &Bus) {
+    bus.bump_ref_generation();
+    let base_seq = bus.guide_sample.load_full().map(|s| s.seq).unwrap_or(0);
+    match guiding::next_sample(bus, base_seq, Duration::from_secs(2)).await {
+        Some(sample) => {
+            if let Ok(mut sh) = bus.shared.lock() {
+                sh.lock_point = Some((sample.x, sample.y));
+                sh.guide_err = None;
+                sh.guide_rms = 0.0;
+                sh.guide_history.clear();
+            }
+            bus.log("re-locked");
+        }
+        None => bus.log("re-lock: no target detected"),
+    }
 }
 
 fn set_streaming(bus: &Bus, on: bool) {

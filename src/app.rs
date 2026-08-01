@@ -1,11 +1,13 @@
 //! egui front-end: live view, camera controls, mount controls, and status/log.
 
+use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 
 use eframe::egui;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::bus::{Bus, Command, ConnState, Dir};
+use crate::guiding::{GuideMode, GuideParams};
 
 const DIRS: [(Dir, &str); 4] = [
     (Dir::North, "N"),
@@ -48,6 +50,13 @@ pub struct App {
     /// In-progress ROI drag on the live view: (start, current) in screen coordinates.
     roi_drag: Option<(egui::Pos2, egui::Pos2)>,
 
+    // ---- guiding (M2) UI state ----
+    /// Editable copies backing the guiding controls; changes are pushed to the worker.
+    guide_mode: GuideMode,
+    guide_params: GuideParams,
+    /// Show the detected-target / lock-point overlay on the live view.
+    detect_overlay: bool,
+
     // ---- test/automation hooks (driven by env vars) ----
     autoconnect: bool,
     autostream: bool,
@@ -84,6 +93,9 @@ impl App {
             roi_h: 0,
             roi_seeded_for: (0, 0),
             roi_drag: None,
+            guide_mode: GuideMode::Disk,
+            guide_params: GuideParams::default(),
+            detect_overlay: false,
             // A screenshot run implies autoconnect + autostream so there is content to show.
             autoconnect: autoconnect || screenshot_path.is_some(),
             autostream: autoconnect || screenshot_path.is_some(),
@@ -152,6 +164,15 @@ struct Snap {
     sensor_w: u32,
     sensor_h: u32,
     roi: (u32, u32, u32, u32),
+    // guiding (M2)
+    guiding: bool,
+    calibrating: bool,
+    calibrated: bool,
+    lock_point: Option<(f32, f32)>,
+    detected: Option<(f32, f32)>,
+    guide_err: Option<(f32, f32)>,
+    guide_rms: f32,
+    guide_history: VecDeque<(f32, f32)>,
     log_tail: Vec<String>,
 }
 
@@ -174,6 +195,14 @@ impl App {
             sensor_w: sh.sensor_w,
             sensor_h: sh.sensor_h,
             roi: sh.roi,
+            guiding: sh.guiding,
+            calibrating: sh.calibrating,
+            calibrated: sh.calibrated,
+            lock_point: sh.lock_point,
+            detected: sh.detected,
+            guide_err: sh.guide_err,
+            guide_rms: sh.guide_rms,
+            guide_history: sh.guide_history.clone(),
             log_tail: sh.log.iter().rev().take(8).rev().cloned().collect(),
         }
     }
@@ -429,6 +458,9 @@ impl eframe::App for App {
                 if ui.button("⛔ Abort motion").clicked() {
                     self.send(Command::Abort);
                 }
+
+                ui.separator();
+                self.guiding_controls(ui, &snap);
             });
         });
 
@@ -439,6 +471,13 @@ impl eframe::App for App {
                 ui.small(line);
             }
         });
+
+        // ---- Bottom: guide-error graph (above the log) ----
+        egui::Panel::bottom("guide_graph")
+            .resizable(true)
+            .show(ui, |ui| {
+                self.guide_graph(ui, &snap);
+            });
 
         // ---- Center: live view (drag to select an ROI) ----
         egui::CentralPanel::default().show(ui, |ui| {
@@ -499,6 +538,29 @@ impl eframe::App for App {
                         egui::StrokeKind::Inside,
                     );
                 }
+            }
+
+            // Guiding overlay: map frame-pixel positions onto the displayed image. The texture
+            // size equals the decoded frame size, so a pixel maps by its fraction of that size.
+            let to_screen = |p: (f32, f32)| -> egui::Pos2 {
+                image_rect.min
+                    + egui::vec2(p.0 / tex_size.x, p.1 / tex_size.y) * image_rect.size()
+            };
+            let painter = ui.painter_at(image_rect);
+            if let Some(lock) = snap.lock_point {
+                let c = to_screen(lock);
+                let stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 210, 0));
+                painter.line_segment([c - egui::vec2(9.0, 0.0), c + egui::vec2(9.0, 0.0)], stroke);
+                painter.line_segment([c - egui::vec2(0.0, 9.0), c + egui::vec2(0.0, 9.0)], stroke);
+            }
+            if let Some(det) = snap.detected {
+                let c = to_screen(det);
+                let col = if snap.guiding {
+                    egui::Color32::from_rgb(80, 220, 120)
+                } else {
+                    egui::Color32::from_rgb(120, 180, 255)
+                };
+                painter.circle_stroke(c, 7.0, egui::Stroke::new(1.5, col));
             }
         });
 
@@ -641,6 +703,142 @@ impl App {
                 handle(ui, 1, Dir::South, DIRS[1].1);
             });
         });
+    }
+
+    /// Guiding section: detection mode, calibrate, start/stop, re-lock, and loop parameters.
+    fn guiding_controls(&mut self, ui: &mut egui::Ui, snap: &Snap) {
+        ui.collapsing("Guiding", |ui| {
+            // Detection mode.
+            ui.horizontal(|ui| {
+                ui.label("Mode:");
+                let mut mode = self.guide_mode;
+                egui::ComboBox::from_id_salt("guide_mode")
+                    .selected_text(match mode {
+                        GuideMode::Disk => "Disk (centroid)",
+                        GuideMode::Surface => "Surface (xcorr)",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut mode, GuideMode::Disk, "Disk (centroid)");
+                        ui.selectable_value(&mut mode, GuideMode::Surface, "Surface (xcorr)");
+                    });
+                if mode != self.guide_mode {
+                    self.guide_mode = mode;
+                    self.send(Command::SetGuideMode(mode));
+                }
+            });
+
+            if ui
+                .checkbox(&mut self.detect_overlay, "Show detection")
+                .changed()
+            {
+                self.send(Command::SetDetectionOverlay(self.detect_overlay));
+            }
+
+            ui.separator();
+
+            // Calibration.
+            ui.horizontal(|ui| {
+                let calibrating = snap.calibrating;
+                if ui
+                    .add_enabled(!calibrating && !snap.guiding, egui::Button::new("Calibrate"))
+                    .clicked()
+                {
+                    self.send(Command::Calibrate);
+                }
+                if calibrating {
+                    ui.spinner();
+                    ui.label("calibrating…");
+                } else if snap.calibrated {
+                    ui.colored_label(egui::Color32::GREEN, "calibrated ✓");
+                } else {
+                    ui.colored_label(egui::Color32::GRAY, "not calibrated");
+                }
+            });
+
+            // Start / stop / re-lock.
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        snap.calibrated && !snap.guiding,
+                        egui::Button::new("▶ Guide"),
+                    )
+                    .clicked()
+                {
+                    self.send(Command::StartGuiding);
+                }
+                if ui
+                    .add_enabled(snap.guiding, egui::Button::new("⏹ Stop"))
+                    .clicked()
+                {
+                    self.send(Command::StopGuiding);
+                }
+                if ui
+                    .add_enabled(snap.guiding, egui::Button::new("Re-lock"))
+                    .clicked()
+                {
+                    self.send(Command::Relock);
+                }
+            });
+
+            ui.separator();
+
+            // Loop parameters — pushed to the worker on change.
+            let mut p = self.guide_params;
+            let mut changed = false;
+            changed |= ui
+                .add(egui::Slider::new(&mut p.aggressiveness, 0.05..=1.0).text("aggressiveness"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut p.max_pulse_ms, 50.0..=2000.0).text("max pulse (ms)"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut p.min_move_px, 0.0..=5.0).text("min move (px)"))
+                .changed();
+            let mut cadence = p.cadence_ms as f64;
+            if ui
+                .add(egui::Slider::new(&mut cadence, 100.0..=2000.0).text("cadence (ms)"))
+                .changed()
+            {
+                p.cadence_ms = cadence as u64;
+                changed = true;
+            }
+            if changed {
+                self.guide_params = p;
+                self.send(Command::SetGuideParams(p));
+            }
+        });
+    }
+
+    /// The guide-error graph (RA/DEC over time) plus live error / RMS readout.
+    fn guide_graph(&self, ui: &mut egui::Ui, snap: &Snap) {
+        use egui_plot::{Legend, Line, Plot, PlotPoints};
+        ui.horizontal(|ui| {
+            ui.strong("Guide error");
+            if let Some((dx, dy)) = snap.guide_err {
+                ui.label(format!("dx {dx:+.2}  dy {dy:+.2} px"));
+            }
+            ui.label(format!("RMS {:.2} px", snap.guide_rms));
+        });
+        let dx: PlotPoints = snap
+            .guide_history
+            .iter()
+            .enumerate()
+            .map(|(i, (x, _))| [i as f64, *x as f64])
+            .collect();
+        let dy: PlotPoints = snap
+            .guide_history
+            .iter()
+            .enumerate()
+            .map(|(i, (_, y))| [i as f64, *y as f64])
+            .collect();
+        Plot::new("guide_plot")
+            .height(110.0)
+            .legend(Legend::default())
+            .show_axes([false, true])
+            .show(ui, |plot_ui| {
+                plot_ui.line(Line::new("RA (dx)", dx));
+                plot_ui.line(Line::new("DEC (dy)", dy));
+            });
     }
 }
 

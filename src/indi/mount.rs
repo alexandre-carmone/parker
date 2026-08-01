@@ -125,13 +125,19 @@ impl Mount {
     }
 
     /// Issue a timed guide pulse of `millis` in `dir` (used by the M2 guiding loop).
-    #[allow(dead_code)]
+    ///
+    /// Fire-and-forget via `set`, not `change`: a timed guide pulse holds the property `Busy`
+    /// for its whole duration and its element value counts *down* from the requested time, so
+    /// `change` — which waits for the property to settle back to the value we sent — never
+    /// completes (the same reason [`crate::indi::camera::Camera::toggle_stream`] uses `set`).
+    /// The caller is responsible for spacing pulses so they don't overlap.
     pub async fn pulse_guide(&self, dir: Dir, millis: f64) -> Result<()> {
         let (param, elem) = guide_target(dir);
-        let _ = self
-            .dev
-            .change(param, vec![(elem, Sexagesimal::from(millis))])
+        self.dev
+            .parameter(param)
             .await
+            .map_err(|e| anyhow!("finding {param}: {e:?}"))?
+            .set(vec![(elem, Sexagesimal::from(millis))])
             .map_err(|e| anyhow!("pulse guide {dir:?}: {e:?}"))?;
         Ok(())
     }
