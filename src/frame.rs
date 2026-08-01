@@ -3,6 +3,7 @@
 use std::time::Instant;
 
 use anyhow::{anyhow, Result};
+use egui::{Color32, ColorImage};
 use image::ImageFormat;
 
 /// A single decoded frame from the camera video stream, stored as RGBA8 so it can be
@@ -46,5 +47,75 @@ impl Frame {
         let rgba = img.to_rgba8();
         let (w, h) = (rgba.width() as usize, rgba.height() as usize);
         Ok(Frame::new(w, h, rgba.into_raw(), seq))
+    }
+
+    /// Apply the live-view display stretch and produce an egui image ready for texture upload.
+    ///
+    /// This is the per-frame CPU hot path (a full scan for `auto`, then one pass building the
+    /// `Color32` buffer). It is intentionally kept off the GUI thread — the worker calls it and
+    /// publishes the result via [`crate::bus::Bus::publish_display`], so the UI only uploads.
+    pub fn to_display_image(&self, auto: bool, gain: f32) -> ColorImage {
+        let mut scale = gain.max(0.0);
+        if auto {
+            let max = self
+                .rgba
+                .chunks_exact(4)
+                .flat_map(|p| [p[0], p[1], p[2]])
+                .max()
+                .unwrap_or(255);
+            if max > 0 {
+                scale *= 255.0 / max as f32;
+            }
+        }
+        let size = [self.width, self.height];
+        // Fast path: nothing to stretch, convert straight to Color32.
+        if (scale - 1.0).abs() < f32::EPSILON {
+            return ColorImage::from_rgba_unmultiplied(size, &self.rgba);
+        }
+        let s = |c: u8| (c as f32 * scale).round().clamp(0.0, 255.0) as u8;
+        let pixels = self
+            .rgba
+            .chunks_exact(4)
+            .map(|p| Color32::from_rgba_unmultiplied(s(p[0]), s(p[1]), s(p[2]), p[3]))
+            .collect();
+        ColorImage::new(size, pixels)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(rgba: Vec<u8>) -> Frame {
+        Frame::new(rgba.len() / 4, 1, rgba, 1)
+    }
+
+    #[test]
+    fn identity_when_no_stretch() {
+        let f = frame(vec![10, 20, 30, 255, 40, 50, 60, 255]);
+        let img = f.to_display_image(false, 1.0);
+        assert_eq!(img.size, [2, 1]);
+        assert_eq!(
+            (img.pixels[0].r(), img.pixels[0].g(), img.pixels[0].b()),
+            (10, 20, 30)
+        );
+        assert_eq!(img.pixels[1].b(), 60);
+    }
+
+    #[test]
+    fn auto_stretch_maps_brightest_to_255() {
+        // Brightest channel is 128 → scale 2.0; 64 → 128, 128 → 255, alpha preserved.
+        let f = frame(vec![64, 0, 128, 255]);
+        let img = f.to_display_image(true, 1.0);
+        let p = img.pixels[0];
+        assert_eq!((p.r(), p.g(), p.b(), p.a()), (128, 0, 255, 255));
+    }
+
+    #[test]
+    fn manual_gain_clamps() {
+        let f = frame(vec![200, 10, 0, 255]);
+        let img = f.to_display_image(false, 2.0);
+        let p = img.pixels[0];
+        assert_eq!((p.r(), p.g(), p.b()), (255, 20, 0));
     }
 }

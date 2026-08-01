@@ -22,3 +22,14 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 [[example]]
 name = "probe"
 path = "examples/probe.rs"
+
+# Live video decoding is numeric-heavy: an unoptimized `image` JPEG decode of an 8 MP frame
+# takes ~3.4 s (0.3 fps), which throttles the stream to a crawl in a plain `cargo run` debug
+# build. Optimize dependencies fully (they rarely rebuild) and give our own crate a light
+# opt-level so the per-frame decode/stretch loops are usable while incremental compiles stay
+# fast. For real imaging sessions prefer `cargo run --release`.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

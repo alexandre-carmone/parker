@@ -10,8 +10,17 @@ use solar::worker;
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,solar=info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                // Two dependencies flood the log during streaming with recoverable, non-actionable
+                // ERRORs, so we silence them by default (set RUST_LOG to see them when debugging):
+                //   * `indi::client` — its reader loop logs an ERROR for every wire message it
+                //     can't model, then continues; drivers re-send un-parseable properties (`FPS`
+                //     with an empty `EST_FPS`, telescope `TELESCOPE_MOUNT_TYPE`) on every update.
+                //   * `twinkle_client` — the Notify primitive `indi` builds on logs a lock-acquire
+                //     timeout (~1/s) whenever a value stays referenced too long, which the heavy
+                //     blob traffic of a live video stream causes constantly.
+                "info,solar=info,indi::client=off,twinkle_client=off".into()
+            }),
         )
         .init();
 

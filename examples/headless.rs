@@ -25,20 +25,24 @@ async fn main() -> Result<()> {
 
     // 1. Connect + auto-connect both devices.
     let session = indi::connect(ADDR).await?;
+    let camera = session.camera.as_ref().expect("camera present (simulators)");
+    let mount = session.mount.as_ref().expect("mount present (simulators)");
     println!("[headless] connected; camera + mount online");
 
-    let rates = session.mount.slew_rates().await?;
+    let rates = mount.slew_rates().await?;
     println!("[headless] slew rates: {rates:?}");
 
-    // 2. Start the video stream and collect frames.
-    let param = session
-        .camera
-        .dev
+    // 2. Start the video stream and collect frames. Frames arrive on the session's dedicated
+    // blob connection (the control connection is BlobEnable::Never), so subscribe there.
+    let frame_dev = session
+        .frame_device()
+        .expect("frame device present (camera bound)");
+    let param = frame_dev
         .get_parameter("CCD1")
         .await
         .map_err(|e| anyhow!("subscribing CCD1: {e:?}"))?;
     let mut changes = param.changes();
-    session.camera.start_stream().await?;
+    camera.start_stream().await?;
     println!("[headless] stream started; waiting for frames…");
 
     let mut got: Option<Frame> = None;
@@ -82,21 +86,21 @@ async fn main() -> Result<()> {
     // Drop the frame subscription to relieve lock pressure, then stop the stream
     // (best-effort: the single control connection can lag while blobs are in transit).
     drop(changes);
-    if let Err(e) = session.camera.stop_stream().await {
+    if let Err(e) = camera.stop_stream().await {
         println!("[headless] note: stop_stream lagged: {e}");
     } else {
         println!("[headless] stream stopped");
     }
 
     // 4. Mount nudge with read-back.
-    session.mount.nudge(Dir::North, true).await?;
+    mount.nudge(Dir::North, true).await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let moving_on = session.mount.is_moving(Dir::North).await?;
-    session.mount.nudge(Dir::North, false).await?;
+    let moving_on = mount.is_moving(Dir::North).await?;
+    mount.nudge(Dir::North, false).await?;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let moving_off = session.mount.is_moving(Dir::North).await?;
+    let moving_off = mount.is_moving(Dir::North).await?;
     println!("[headless] nudge North: moving_on={moving_on} moving_off={moving_off}");
-    session.mount.abort().await?;
+    mount.abort().await?;
 
     if !moving_on || moving_off {
         return Err(anyhow!(

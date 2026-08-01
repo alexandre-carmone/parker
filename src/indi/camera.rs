@@ -15,17 +15,14 @@ impl Camera {
         Camera { dev }
     }
 
-    /// Connect the device, enable BLOB transport for CCD1, and prefer the MJPEG encoder.
+    /// Connect the device and prefer the MJPEG encoder. BLOB transport is enabled separately
+    /// via [`Camera::set_blob`] so the session can route frames onto a dedicated connection.
     pub async fn connect(&self) -> Result<()> {
         let _ = self
             .dev
             .change("CONNECTION", vec![("CONNECT", true)])
             .await
             .map_err(|e| anyhow!("connecting camera: {e:?}"))?;
-        self.dev
-            .enable_blob(Some("CCD1"), indi::BlobEnable::Also)
-            .await
-            .map_err(|e| anyhow!("enabling BLOB transport: {e:?}"))?;
         // MJPEG frames are the simplest to decode; ignore failure (some drivers lack it).
         if let Err(e) = self
             .dev
@@ -34,6 +31,16 @@ impl Camera {
         {
             tracing::warn!("could not select MJPEG encoder: {e:?}");
         }
+        Ok(())
+    }
+
+    /// Set this connection's CCD1 BLOB transport policy (`Never`/`Also`/`Only`). BLOB enable is
+    /// per-connection server state, which is what lets us isolate frame data on its own socket.
+    pub async fn set_blob(&self, enabled: indi::BlobEnable) -> Result<()> {
+        self.dev
+            .enable_blob(Some("CCD1"), enabled)
+            .await
+            .map_err(|e| anyhow!("setting BLOB transport: {e:?}"))?;
         Ok(())
     }
 

@@ -1,5 +1,7 @@
 //! egui front-end: live view, camera controls, mount controls, and status/log.
 
+use std::sync::atomic::Ordering;
+
 use eframe::egui;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -21,7 +23,8 @@ pub struct App {
     addr: String,
     capture_dir: String,
     texture: Option<egui::TextureHandle>,
-    last_seq: u64,
+    /// Last display image seq uploaded to the texture (the streaming fast path).
+    last_display_seq: u64,
     /// Per-direction "currently held" state for press-and-hold nudging (N, S, E, W).
     nudge_down: [bool; 4],
     gain_input: f64,
@@ -47,6 +50,8 @@ impl App {
     pub fn new(bus: Bus, tx: UnboundedSender<Command>, rt: tokio::runtime::Runtime) -> Self {
         let autoconnect = std::env::var("SOLAR_AUTOCONNECT").is_ok();
         let screenshot_path = std::env::var("SOLAR_SCREENSHOT").ok();
+        // Seed the worker's stretch settings from our defaults below.
+        bus.set_display_settings(true, 1.0);
         App {
             bus,
             tx,
@@ -54,7 +59,7 @@ impl App {
             addr: "127.0.0.1:7624".to_owned(),
             capture_dir: "captures".to_owned(),
             texture: None,
-            last_seq: 0,
+            last_display_seq: 0,
             nudge_down: [false; 4],
             gain_input: 90.0,
             exposure_input: 0.05,
@@ -75,24 +80,39 @@ impl App {
         let _ = self.tx.send(cmd);
     }
 
-    /// Upload the newest decoded frame to the GPU texture (only when the sequence changed),
-    /// applying the display stretch so faint frames are visible.
-    fn refresh_texture(&mut self, ctx: &egui::Context) {
-        if let Some(frame) = self.bus.latest_frame.load_full() {
-            if frame.seq != self.last_seq || self.stretch_dirty {
-                self.last_seq = frame.seq;
+    /// Refresh the GPU texture from the newest frame.
+    ///
+    /// Fast path (streaming): the worker has already done the stretch + `Color32` conversion off
+    /// this thread, so we just upload its `Arc<ColorImage>` — no per-frame CPU work here, which is
+    /// what keeps the UI responsive at high FPS. Slow path (`stretch_dirty` while paused): the user
+    /// moved a display control with no new frames arriving, so re-render the last raw frame once on
+    /// this thread — it is user-paced, never the streaming hot loop.
+    fn refresh_texture(&mut self, ctx: &egui::Context, streaming: bool) {
+        let dseq = self.bus.display_seq.load(Ordering::Acquire);
+        if dseq != self.last_display_seq {
+            if let Some(img) = self.bus.display.load_full() {
+                self.last_display_seq = dseq;
                 self.stretch_dirty = false;
-                let pixels = stretch(&frame.rgba, self.auto_stretch, self.display_gain);
-                let color =
-                    egui::ColorImage::from_rgba_unmultiplied([frame.width, frame.height], &pixels);
-                match &mut self.texture {
-                    Some(tex) => tex.set(color, egui::TextureOptions::LINEAR),
-                    None => {
-                        self.texture =
-                            Some(ctx.load_texture("live", color, egui::TextureOptions::LINEAR))
-                    }
-                }
+                self.upload(ctx, img);
+                return;
             }
+        }
+        // Nothing new from the worker; only re-render on this thread if a paused adjustment needs it.
+        if self.stretch_dirty && !streaming {
+            if let Some(frame) = self.bus.latest_frame.load_full() {
+                self.stretch_dirty = false;
+                let img = std::sync::Arc::new(frame.to_display_image(self.auto_stretch, self.display_gain));
+                self.upload(ctx, img);
+            }
+        }
+    }
+
+    /// Upload a display image to the live texture (creating it on first use). Passing the
+    /// `Arc<ColorImage>` in is zero-copy: egui wraps the same allocation.
+    fn upload(&mut self, ctx: &egui::Context, img: std::sync::Arc<egui::ColorImage>) {
+        match &mut self.texture {
+            Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
+            None => self.texture = Some(ctx.load_texture("live", img, egui::TextureOptions::LINEAR)),
         }
     }
 }
@@ -103,6 +123,10 @@ struct Snap {
     streaming: bool,
     fps: f32,
     frame_count: u64,
+    cameras: Vec<String>,
+    mounts: Vec<String>,
+    camera_sel: String,
+    mount_sel: String,
     slew_rates: Vec<String>,
     slew_rate_idx: usize,
     tracking: bool,
@@ -118,6 +142,10 @@ impl App {
             streaming: sh.streaming,
             fps: sh.fps,
             frame_count: sh.frame_count,
+            cameras: sh.cameras.clone(),
+            mounts: sh.mounts.clone(),
+            camera_sel: sh.camera_sel.clone(),
+            mount_sel: sh.mount_sel.clone(),
             slew_rates: sh.slew_rates.clone(),
             slew_rate_idx: sh.slew_rate_idx,
             tracking: sh.tracking,
@@ -131,8 +159,8 @@ impl eframe::App for App {
     // egui 0.35: the App trait provides a root `Ui`; panels attach to it (not the Context).
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.refresh_texture(&ctx);
         let snap = self.snapshot();
+        self.refresh_texture(&ctx, snap.streaming);
         let connected = snap.conn == ConnState::Connected;
 
         // ---- Top bar: connection + status ----
@@ -175,6 +203,25 @@ impl eframe::App for App {
         egui::Panel::left("camera").resizable(false).min_size(210.0).show(ui, |ui| {
             ui.heading("Camera");
             ui.add_enabled_ui(connected, |ui| {
+                if !snap.cameras.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.label("Device:");
+                        egui::ComboBox::from_id_salt("camera_dev")
+                            .selected_text(snap.camera_sel.clone())
+                            .show_ui(ui, |ui| {
+                                for name in &snap.cameras {
+                                    if ui
+                                        .selectable_label(*name == snap.camera_sel, name)
+                                        .clicked()
+                                        && *name != snap.camera_sel
+                                    {
+                                        self.send(Command::SelectCamera(name.clone()));
+                                    }
+                                }
+                            });
+                    });
+                    ui.separator();
+                }
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(!snap.streaming, egui::Button::new("▶ Start stream"))
@@ -223,13 +270,20 @@ impl eframe::App for App {
 
             ui.separator();
             ui.label("Display");
+            let mut settings_changed = false;
             if ui.checkbox(&mut self.auto_stretch, "Auto-stretch").changed() {
-                self.stretch_dirty = true;
+                settings_changed = true;
             }
             if ui
                 .add(egui::Slider::new(&mut self.display_gain, 0.1..=20.0).text("gain"))
                 .changed()
             {
+                settings_changed = true;
+            }
+            if settings_changed {
+                // Push to the worker (applied to new frames), and mark dirty so a paused still
+                // frame is re-rendered on the next repaint.
+                self.bus.set_display_settings(self.auto_stretch, self.display_gain);
                 self.stretch_dirty = true;
             }
         });
@@ -238,6 +292,25 @@ impl eframe::App for App {
         egui::Panel::right("mount").resizable(false).min_size(210.0).show(ui, |ui| {
             ui.heading("Mount");
             ui.add_enabled_ui(connected, |ui| {
+                if !snap.mounts.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.label("Device:");
+                        egui::ComboBox::from_id_salt("mount_dev")
+                            .selected_text(snap.mount_sel.clone())
+                            .show_ui(ui, |ui| {
+                                for name in &snap.mounts {
+                                    if ui
+                                        .selectable_label(*name == snap.mount_sel, name)
+                                        .clicked()
+                                        && *name != snap.mount_sel
+                                    {
+                                        self.send(Command::SelectMount(name.clone()));
+                                    }
+                                }
+                            });
+                    });
+                    ui.separator();
+                }
                 // Slew rate
                 if !snap.slew_rates.is_empty() {
                     ui.horizontal(|ui| {
@@ -392,33 +465,4 @@ impl App {
             });
         });
     }
-}
-
-/// Apply a display stretch to an RGBA frame for the live view. With `auto`, the brightest
-/// channel value is mapped to 255 (a simple linear autostretch); `gain` is an extra
-/// multiplier. Alpha is preserved. Returns a new buffer.
-fn stretch(rgba: &[u8], auto: bool, gain: f32) -> Vec<u8> {
-    let mut scale = gain.max(0.0);
-    if auto {
-        let max = rgba
-            .chunks_exact(4)
-            .flat_map(|p| [p[0], p[1], p[2]])
-            .max()
-            .unwrap_or(255);
-        if max > 0 {
-            scale *= 255.0 / max as f32;
-        }
-    }
-    // Fast path: no change needed.
-    if (scale - 1.0).abs() < f32::EPSILON {
-        return rgba.to_vec();
-    }
-    let mut out = Vec::with_capacity(rgba.len());
-    for p in rgba.chunks_exact(4) {
-        for &c in &p[..3] {
-            out.push((c as f32 * scale).round().clamp(0.0, 255.0) as u8);
-        }
-        out.push(p[3]);
-    }
-    out
 }
