@@ -47,6 +47,12 @@ struct RecordTask {
 /// loop and the overlay without doing centroid/NCC work on every high-FPS frame.
 const DETECT_INTERVAL: Duration = Duration::from_millis(100);
 
+/// While recording, throttle the live display to this interval. The stretch + Color32 conversion
+/// and GUI upload are the costly per-frame work; skipping most of them during a recording keeps
+/// CPU for writing the SER file while still showing a ~few-Hz preview. Frames are still decoded
+/// and written every time — only the on-screen refresh is rate-limited.
+const DISPLAY_INTERVAL_RECORDING: Duration = Duration::from_millis(200);
+
 /// Entry point for the worker task. Runs until the command channel closes.
 pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Context) {
     let mut session: Option<Session> = None;
@@ -531,6 +537,7 @@ async fn spawn_frame_task(
             // Guiding detector state persists across frames (holds the Surface reference patch).
             let mut detector = GuideDetector::default();
             let mut last_detect: Option<Instant> = None;
+            let mut last_display: Option<Instant> = None;
             while let Some(raw) = slot.wait() {
                 match decode_frame(&bus, &raw, seq + 1) {
                     Ok((frame, raw_pixels)) => {
@@ -593,12 +600,19 @@ async fn spawn_frame_task(
 
                         // Do the display stretch + Color32 conversion here, off the GUI
                         // thread, and publish a ready-to-upload image. Keep the raw frame
-                        // for capture.
-                        let (auto, gain) = bus.display_settings();
-                        let img = frame.to_display_image(auto, gain);
+                        // for capture. While recording, rate-limit this to spare CPU for the
+                        // SER writer — the preview refreshes at a few Hz instead of full FPS.
+                        let display_due = !bus.recording_active()
+                            || last_display
+                                .is_none_or(|t| now.duration_since(t) >= DISPLAY_INTERVAL_RECORDING);
+                        if display_due {
+                            last_display = Some(now);
+                            let (auto, gain) = bus.display_settings();
+                            let img = frame.to_display_image(auto, gain);
+                            bus.publish_display(img);
+                            ctx.request_repaint();
+                        }
                         bus.latest_frame.store(Some(Arc::new(frame)));
-                        bus.publish_display(img);
-                        ctx.request_repaint();
                     }
                     Err(e) => tracing::warn!("frame decode failed: {e}"),
                 }
