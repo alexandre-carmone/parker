@@ -190,7 +190,7 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                 }
                 ctx.request_repaint();
             }
-            Command::Calibrate => {
+            Command::Calibrate { pulse_ms } => {
                 if calib_task.is_some() {
                     bus.log("calibration already running");
                 } else if guide_loop.is_some() {
@@ -204,7 +204,7 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                             bus.bump_ref_generation(); // fresh Surface reference at frame center
                             let (b, c) = (bus.clone(), ctx.clone());
                             calib_task = Some(tokio::spawn(async move {
-                                guiding::run_calibration(m, b, c).await;
+                                guiding::run_calibration(m, b, c, pulse_ms).await;
                             }));
                         }
                     }
@@ -901,6 +901,17 @@ async fn dispatch(cmd: Command, s: &Session, bus: &Bus) -> Result<()> {
             bus.refresh_detect();
         }
         Command::Relock => relock(bus).await,
+        Command::ClearCalibration => {
+            if let Ok(mut sh) = bus.shared.lock() {
+                if sh.guiding {
+                    sh.log("stop guiding before clearing calibration");
+                } else {
+                    sh.calibrated = false;
+                    sh.guide_calib = None;
+                    sh.log("calibration cleared");
+                }
+            }
+        }
         Command::SetRoi { x, y, w, h } => set_roi(s, bus, x, y, w, h).await?,
         Command::ResetRoi => {
             let (w, h) = {
@@ -917,7 +928,7 @@ async fn dispatch(cmd: Command, s: &Session, bus: &Bus) -> Result<()> {
         | Command::Disconnect
         | Command::SelectCamera(_)
         | Command::SelectMount(_)
-        | Command::Calibrate
+        | Command::Calibrate { .. }
         | Command::StartGuiding
         | Command::StopGuiding
         | Command::StartRecording(_)

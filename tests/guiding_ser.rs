@@ -248,12 +248,14 @@ fn guiding_locks_and_tracks_recorded_drift() {
     // And the concrete pulses issued this cycle oppose the drift on each axis that clears the
     // deadband: +x drift → pulse East, −x → West; +y → South, −y → North.
     let params = GuideParams {
-        aggressiveness: 1.0,
+        ra_aggr: 1.0,
+        dec_aggr: 1.0,
         ..Default::default()
     };
     let pulses = pulses_for(&cal, &params, drift);
     for (dir, ms) in &pulses {
-        assert!(*ms <= params.max_pulse_ms as f64, "pulse {ms} exceeds max");
+        let max = params.ra_max_pulse_ms.max(params.dec_max_pulse_ms) as f64;
+        assert!(*ms <= max, "pulse {ms} exceeds max");
         match dir {
             Dir::East => assert!(drift.0 > 0.0, "East pulse but drift.x = {}", drift.0),
             Dir::West => assert!(drift.0 < 0.0, "West pulse but drift.x = {}", drift.0),

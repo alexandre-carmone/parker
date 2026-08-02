@@ -214,7 +214,9 @@ async fn main() {
     })
     .await;
     if detected {
-        send(Command::Calibrate);
+        send(Command::Calibrate {
+            pulse_ms: solar::guiding::DEFAULT_CALIB_MS,
+        });
         let calibrated = wait_until("calibration finished", Duration::from_secs(30), || {
             let sh = bus.shared.lock().unwrap();
             !sh.calibrating && sh.calibrated

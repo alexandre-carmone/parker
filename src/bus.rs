@@ -67,8 +67,11 @@ pub enum Command {
     StopRecording,
 
     // ---- guiding (M2) ----
-    /// Run the automatic pulse-based calibration (measures the pixel→mount mapping).
-    Calibrate,
+    /// Run the automatic pulse-based calibration (measures the pixel→mount mapping). `pulse_ms`
+    /// is the per-move pulse duration.
+    Calibrate { pulse_ms: f32 },
+    /// Discard the current calibration (forces a re-calibrate before guiding again).
+    ClearCalibration,
     /// Begin auto-guiding: lock onto the current target and correct drift with pulse-guides.
     StartGuiding,
     /// Stop auto-guiding.
@@ -205,11 +208,17 @@ pub struct Shared {
     pub lock_point: Option<(f32, f32)>,
     /// Most recent detected target position (for the on-screen overlay).
     pub detected: Option<(f32, f32)>,
-    /// Most recent guide error `(dx, dy) = detected − lock_point`.
+    /// Most recent guide error `(ra, dec)`, in mount-frame pixels (the sensor error projected onto
+    /// the calibration axes).
     pub guide_err: Option<(f32, f32)>,
     /// RMS of the recent guide error magnitude (pixels).
     pub guide_rms: f32,
-    /// Rolling guide-error history `(dx, dy)` for the graph, capped.
+    /// RMS of the RA and DEC error components separately (mount-frame pixels).
+    pub guide_rms_ra: f32,
+    pub guide_rms_dec: f32,
+    /// Largest single error magnitude in the history window (pixels).
+    pub guide_peak: f32,
+    /// Rolling guide-error history `(ra, dec)` (mount-frame pixels) for the graph, capped.
     pub guide_history: VecDeque<(f32, f32)>,
     /// Live guiding-loop parameters (edited in the UI, read by the guide loop).
     pub guide_params: GuideParams,
@@ -252,6 +261,9 @@ impl Default for Shared {
             detected: None,
             guide_err: None,
             guide_rms: 0.0,
+            guide_rms_ra: 0.0,
+            guide_rms_dec: 0.0,
+            guide_peak: 0.0,
             guide_history: VecDeque::new(),
             guide_params: GuideParams::default(),
             guide_mode: GuideMode::Disk,

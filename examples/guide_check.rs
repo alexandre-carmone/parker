@@ -77,7 +77,9 @@ async fn main() {
 
     if detected {
         println!("calibrating (pulses the mount N/S/E/W) …");
-        send(Command::Calibrate);
+        send(Command::Calibrate {
+            pulse_ms: solar::guiding::DEFAULT_CALIB_MS,
+        });
         // Calibration issues four ~1.5s pulses with settle time.
         wait_until("calibration finished", Duration::from_secs(30), || {
             let sh = bus.shared.lock().unwrap();
