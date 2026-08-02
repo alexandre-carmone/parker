@@ -370,6 +370,7 @@ async fn init_sensor_size(s: &Session, bus: &Bus) {
                 sh.roi = (0, 0, w, h);
             }
             bus.set_stream_geometry(w, h);
+            bus.set_sensor_size(w, h);
             bus.log(format!("sensor: {w}×{h}"));
         }
         Err(e) => bus.log(format!("reading sensor size: {e}")),
@@ -650,29 +651,80 @@ async fn spawn_frame_task(
 /// allocation-free.
 fn decode_frame(bus: &Bus, raw: &RawFrame, seq: u64) -> Result<(Frame, Option<Vec<u8>>)> {
     let fmt = raw.format.as_deref();
-    let is_jpeg = fmt
+    // Trust the payload's own magic bytes over the driver's format label: some drivers
+    // (e.g. Player One) keep delivering MJPEG frames while `CCD_STREAM_ENCODER` reports RAW, so
+    // a label-only check misroutes compressed frames to the raw decoder and every frame fails the
+    // pixel-count assertion. Sniffing the header decodes them correctly regardless of the label.
+    let label_jpeg = fmt
         .map(|f| f.contains("jpg") || f.contains("jpeg"))
         .unwrap_or(false);
-    if is_jpeg {
+    if label_jpeg || looks_like_jpeg(&raw.data) {
         return Ok((Frame::from_stream_blob(fmt, &raw.data, seq)?, None));
     }
 
-    let (w, h) = bus.frame_geometry();
-    let (w, h) = (w as usize, h as usize);
-    if fmt.map(|f| f.ends_with(".z")).unwrap_or(false) {
+    let label_zlib = fmt.map(|f| f.ends_with(".z")).unwrap_or(false);
+    if label_zlib || looks_like_zlib(&raw.data) {
         // Compressed raw: we must inflate for the display decode anyway, so reuse the buffer.
         let pixels = inflate_zlib(&raw.data).map_err(|e| anyhow!("inflating raw stream: {e}"))?;
         bus.set_last_raw_len(pixels.len());
+        let (w, h) = resolve_raw_geometry(bus, pixels.len());
         let frame = Frame::from_raw_stream(&pixels, w, h, seq)?;
         let rec = bus.recording_active().then_some(pixels);
         Ok((frame, rec))
     } else {
         bus.set_last_raw_len(raw.data.len());
+        let (w, h) = resolve_raw_geometry(bus, raw.data.len());
         let frame = Frame::from_raw_stream(&raw.data, w, h, seq)?;
         // Clone the native bytes only when recording is actually running.
         let rec = bus.recording_active().then(|| raw.data.as_ref().clone());
         Ok((frame, rec))
     }
+}
+
+/// A JPEG stream begins with the SOI marker `FF D8 FF`. Used to detect MJPEG frames a driver
+/// mislabels (see [`decode_frame`]).
+fn looks_like_jpeg(data: &[u8]) -> bool {
+    matches!(data, [0xFF, 0xD8, 0xFF, ..])
+}
+
+/// A zlib stream begins with a header byte whose low nibble is 8 (deflate) followed by a byte that
+/// makes the two-byte header a multiple of 31. `0x78` (32K window) is by far the most common first
+/// byte; checking the checksum keeps this from matching arbitrary raw pixel data.
+fn looks_like_zlib(data: &[u8]) -> bool {
+    match data {
+        [cmf, flg, ..] => (cmf & 0x0F) == 8 && (u16::from(*cmf) << 8 | u16::from(*flg)) % 31 == 0,
+        _ => false,
+    }
+}
+
+/// Choose the `(width, height)` to decode a dimensionless raw frame with. Normally this is the
+/// requested readout geometry, but some drivers (e.g. Player One) stream the *full sensor* even
+/// after a subframe is set — `CCD_STREAM_FRAME` then echoes the requested ROI while the pixels on
+/// the wire are full-frame, so every frame would fail the size check. We detect that by comparing
+/// the payload length against both candidates and, if only the full sensor matches, decode as full
+/// sensor and correct the stored geometry (so recording sizes its SER file right too), logging the
+/// discrepancy once. Falls back to the requested geometry when neither matches, preserving the
+/// original error path.
+fn resolve_raw_geometry(bus: &Bus, len: usize) -> (usize, usize) {
+    let (rw, rh) = bus.frame_geometry();
+    let matches = |w: u32, h: u32| {
+        let px = (w as usize).saturating_mul(h as usize);
+        px != 0 && (len == px || len == px * 2)
+    };
+    if matches(rw, rh) {
+        return (rw as usize, rh as usize);
+    }
+    let (sw, sh) = bus.sensor_size();
+    if matches(sw, sh) && (sw, sh) != (rw, rh) {
+        bus.set_stream_geometry(sw, sh);
+        bus.log(format!(
+            "driver streamed full sensor {sw}×{sh}, not the requested ROI {rw}×{rh} — \
+             showing full frame (this camera may not support subframing the live stream)"
+        ));
+        return (sw as usize, sh as usize);
+    }
+    // Neither matched: keep the requested geometry so `from_raw_stream` reports the mismatch.
+    (rw as usize, rh as usize)
 }
 
 /// Borrow the bound camera, or error if none is selected.
@@ -691,9 +743,15 @@ fn mount(s: &Session) -> Result<&Mount> {
 async fn dispatch(cmd: Command, s: &Session, bus: &Bus) -> Result<()> {
     match cmd {
         Command::StartStream => {
-            camera(s)?.start_stream().await?;
+            let cam = camera(s)?;
+            cam.start_stream().await?;
             set_streaming(bus, true);
             bus.log("video stream on");
+            // Surface the driver's client preview-fps cap: it defaults low (~10) on many drivers
+            // and throttles delivery regardless of ROI. `start_stream` raises it to this max.
+            if let Some((val, _min, max)) = cam.number_range("LIMITS", "LIMITS_PREVIEW_FPS").await {
+                bus.log(format!("preview-fps limit {val:.0} (max {max:.0})"));
+            }
         }
         Command::StopStream => {
             camera(s)?.stop_stream().await?;
@@ -704,15 +762,65 @@ async fn dispatch(cmd: Command, s: &Session, bus: &Bus) -> Result<()> {
             bus.log("video stream off");
         }
         Command::SetGain(v) => {
-            camera(s)?.set_gain(v).await?;
+            let cam = camera(s)?;
+            cam.set_gain(v).await?;
             if let Ok(mut sh) = bus.shared.lock() {
                 sh.gain = v;
             }
+            match cam.number_range("CCD_GAIN", "GAIN").await {
+                Some((val, min, max)) => {
+                    bus.log(format!("gain → {val:.0} (valid {min:.0}–{max:.0})"))
+                }
+                None => bus.log(format!("gain → {v:.0}")),
+            }
         }
         Command::SetExposure(v) => {
-            camera(s)?.set_exposure(v).await?;
+            // Prefer the live-stream exposure (`STREAMING_EXPOSURE`) — it governs the stream frame
+            // rate. Only fall back to the still `CCD_EXPOSURE` when the camera lacks a separate
+            // streaming exposure (e.g. the simulator): setting `CCD_EXPOSURE` while streaming
+            // triggers a one-off still capture whose frame disrupts the video stream.
+            let cam = camera(s)?;
+            let streaming = bus.shared.lock().map(|sh| sh.streaming).unwrap_or(false);
+            let streamed = tokio::time::timeout(Duration::from_secs(2), cam.set_streaming_exposure(v))
+                .await
+                .map(|r| r.is_ok())
+                .unwrap_or(false);
+            if streamed {
+                // The driver applies a new streaming exposure only on stream (re)start, so bounce
+                // it if we're live — otherwise the frame rate wouldn't change until next start.
+                if streaming {
+                    let _ = cam.stop_stream().await;
+                    if let Err(e) = cam.start_stream().await {
+                        bus.log(format!("restarting stream after exposure change failed: {e}"));
+                    }
+                }
+            } else {
+                cam.set_exposure(v).await?;
+            }
             if let Ok(mut sh) = bus.shared.lock() {
                 sh.exposure = v;
+            }
+            // Read back the value the driver actually holds and its valid range, so an
+            // out-of-range request (silently clamped/rejected) is visible. For the streaming
+            // exposure, the value is also the frame-rate ceiling (1/exposure) — the number that
+            // caps streaming fps regardless of ROI.
+            let (prop, elem, label) = if streamed {
+                ("STREAMING_EXPOSURE", "STREAMING_EXPOSURE_VALUE", "streaming exposure")
+            } else {
+                ("CCD_EXPOSURE", "CCD_EXPOSURE_VALUE", "exposure")
+            };
+            match cam.number_range(prop, elem).await {
+                Some((val, min, max)) => {
+                    let ceiling = if val > 0.0 {
+                        format!(", ≈{:.1} fps ceiling", 1.0 / val)
+                    } else {
+                        String::new()
+                    };
+                    bus.log(format!(
+                        "{label} → {val:.4}s (valid {min:.4}–{max:.4}s{ceiling})"
+                    ));
+                }
+                None => bus.log(format!("{label} → {v:.4}s")),
             }
         }
         Command::Nudge { dir, active } => mount(s)?.nudge(dir, active).await?,
@@ -843,6 +951,12 @@ async fn set_roi(s: &Session, bus: &Bus, x: u32, y: u32, w: u32, h: u32) -> Resu
         cam.stop_stream().await?;
     }
     let result = cam.set_frame(x, y, w, h).await;
+    // The driver may snap the requested width/height to hardware alignment (e.g. width to a
+    // multiple of 8), so read back the region it actually applied and use THAT for the decode
+    // geometry — otherwise every raw frame fails the size check. Do this before the restart so
+    // the first streamed frames already match. Fall back to the requested values if unreadable.
+    let (ax, ay, aw, ah) = cam.read_applied_roi().await.unwrap_or((x, y, w, h));
+    bus.set_stream_geometry(aw, ah);
     if streaming {
         // Best-effort restart even if the frame change failed, so the stream isn't left off.
         if let Err(e) = cam.start_stream().await {
@@ -851,10 +965,15 @@ async fn set_roi(s: &Session, bus: &Bus, x: u32, y: u32, w: u32, h: u32) -> Resu
     }
     result?;
     if let Ok(mut sh) = bus.shared.lock() {
-        sh.roi = (x, y, w, h);
+        sh.roi = (ax, ay, aw, ah);
     }
-    bus.set_stream_geometry(w, h);
-    bus.log(format!("ROI set to {w}×{h} at ({x},{y})"));
+    if (aw, ah) != (w, h) {
+        bus.log(format!(
+            "ROI requested {w}×{h}, driver applied {aw}×{ah} at ({ax},{ay})"
+        ));
+    } else {
+        bus.log(format!("ROI set to {aw}×{ah} at ({ax},{ay})"));
+    }
     Ok(())
 }
 
@@ -868,6 +987,39 @@ mod tests {
             data: Arc::new(vec![n]),
             format: None,
         }
+    }
+
+    #[test]
+    fn raw_geometry_prefers_the_requested_roi() {
+        let bus = Bus::new();
+        bus.set_sensor_size(3856, 2180);
+        bus.set_stream_geometry(1500, 1278);
+        // 8-bit ROI payload → ROI geometry, unchanged.
+        assert_eq!(resolve_raw_geometry(&bus, 1500 * 1278), (1500, 1278));
+        assert_eq!(bus.frame_geometry(), (1500, 1278));
+        // 16-bit ROI payload also matches the ROI.
+        assert_eq!(resolve_raw_geometry(&bus, 1500 * 1278 * 2), (1500, 1278));
+    }
+
+    #[test]
+    fn raw_geometry_falls_back_to_full_sensor() {
+        // Driver ignored the ROI and streamed the full sensor: decode as full frame and correct
+        // the stored geometry so later frames match without re-logging.
+        let bus = Bus::new();
+        bus.set_sensor_size(3856, 2180);
+        bus.set_stream_geometry(1500, 1278);
+        assert_eq!(resolve_raw_geometry(&bus, 3856 * 2180), (3856, 2180));
+        assert_eq!(bus.frame_geometry(), (3856, 2180));
+    }
+
+    #[test]
+    fn raw_geometry_keeps_roi_when_nothing_matches() {
+        // Unknown payload size: keep the requested geometry so from_raw_stream reports the error.
+        let bus = Bus::new();
+        bus.set_sensor_size(3856, 2180);
+        bus.set_stream_geometry(1500, 1278);
+        assert_eq!(resolve_raw_geometry(&bus, 12345), (1500, 1278));
+        assert_eq!(bus.frame_geometry(), (1500, 1278));
     }
 
     #[test]

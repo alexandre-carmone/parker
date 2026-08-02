@@ -343,23 +343,23 @@ impl eframe::App for App {
                 ui.separator();
                 self.format_controls(ui, &snap);
                 ui.label("Gain");
-                if ui
-                    .add(egui::DragValue::new(&mut self.gain_input).speed(1.0).range(0.0..=1000.0))
-                    .drag_stopped()
-                {
-                    self.send(Command::SetGain(self.gain_input));
-                }
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut self.gain_input).speed(1.0).range(0.0..=1000.0));
+                    if ui.button("Apply").clicked() {
+                        self.send(Command::SetGain(self.gain_input));
+                    }
+                });
                 ui.label("Exposure (s)");
-                if ui
-                    .add(
+                ui.horizontal(|ui| {
+                    ui.add(
                         egui::DragValue::new(&mut self.exposure_input)
                             .speed(0.005)
                             .range(0.0001..=30.0),
-                    )
-                    .drag_stopped()
-                {
-                    self.send(Command::SetExposure(self.exposure_input));
-                }
+                    );
+                    if ui.button("Apply").clicked() {
+                        self.send(Command::SetExposure(self.exposure_input));
+                    }
+                });
                 ui.separator();
                 ui.label("Capture folder");
                 ui.text_edit_singleline(&mut self.capture_dir);

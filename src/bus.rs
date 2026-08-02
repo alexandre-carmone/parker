@@ -306,6 +306,11 @@ pub struct Bus {
     /// Current readout geometry, so the decode thread can interpret dimensionless raw frames.
     pub frame_w: Arc<AtomicU32>,
     pub frame_h: Arc<AtomicU32>,
+    /// Full sensor size (`(0, 0)` until known). Some drivers stream the full sensor even after a
+    /// subframe is set, so the decode thread uses this as a fallback geometry when a raw frame's
+    /// byte length doesn't match the requested ROI.
+    pub sensor_w: Arc<AtomicU32>,
+    pub sensor_h: Arc<AtomicU32>,
     /// Byte length of the most recent raw (decompressed) frame — lets the orchestrator infer the
     /// stream's bit depth (bytes-per-pixel) when sizing a new SER file.
     pub last_raw_len: Arc<AtomicUsize>,
@@ -328,6 +333,8 @@ impl Bus {
             recorder: Arc::new(Mutex::new(None)),
             frame_w: Arc::new(AtomicU32::new(0)),
             frame_h: Arc::new(AtomicU32::new(0)),
+            sensor_w: Arc::new(AtomicU32::new(0)),
+            sensor_h: Arc::new(AtomicU32::new(0)),
             last_raw_len: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -402,6 +409,21 @@ impl Bus {
         (
             self.frame_w.load(Ordering::Relaxed),
             self.frame_h.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Worker: record the full sensor size (fallback geometry for drivers that stream full frames
+    /// even when a subframe is requested).
+    pub fn set_sensor_size(&self, w: u32, h: u32) {
+        self.sensor_w.store(w, Ordering::Relaxed);
+        self.sensor_h.store(h, Ordering::Relaxed);
+    }
+
+    /// Decode thread: the full sensor size `(w, h)` (`(0, 0)` until known).
+    pub fn sensor_size(&self) -> (u32, u32) {
+        (
+            self.sensor_w.load(Ordering::Relaxed),
+            self.sensor_h.load(Ordering::Relaxed),
         )
     }
 
