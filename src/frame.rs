@@ -49,6 +49,44 @@ impl Frame {
         Ok(Frame::new(w, h, rgba.into_raw(), seq))
     }
 
+    /// Decode a **raw** (`.stream` / decompressed `.stream.z`) mono video frame into a display
+    /// `Frame`. A raw blob carries no dimensions, so `width`/`height` come from the camera's
+    /// current readout region. The bytes-per-sample is inferred from the payload length so the
+    /// same path serves 8- and 16-bit streams:
+    ///
+    /// - `len == width*height`   → 8-bit mono, used directly as gray.
+    /// - `len == width*height*2` → 16-bit little-endian mono, shown via the high byte (the live
+    ///   view's auto-stretch/gain then scales it); the full 16 bits are preserved for recording.
+    ///
+    /// This is mono-first: Bayer/OSC sensors still record correctly (the raw bytes are written
+    /// verbatim with the right ColorID), but here they preview as grayscale — no debayer.
+    pub fn from_raw_stream(data: &[u8], width: usize, height: usize, seq: u64) -> Result<Frame> {
+        let px = width.checked_mul(height).unwrap_or(0);
+        if px == 0 {
+            return Err(anyhow!("raw stream: unknown frame geometry"));
+        }
+        let mut rgba = Vec::with_capacity(px * 4);
+        if data.len() == px {
+            for &g in data {
+                rgba.extend_from_slice(&[g, g, g, 255]);
+            }
+        } else if data.len() == px * 2 {
+            for s in data.chunks_exact(2) {
+                let g = u16::from_le_bytes([s[0], s[1]]);
+                let hi = (g >> 8) as u8;
+                rgba.extend_from_slice(&[hi, hi, hi, 255]);
+            }
+        } else {
+            return Err(anyhow!(
+                "raw stream: {} bytes doesn't match {}×{} mono at 8 or 16 bit",
+                data.len(),
+                width,
+                height
+            ));
+        }
+        Ok(Frame::new(width, height, rgba, seq))
+    }
+
     /// Apply the live-view display stretch and produce an egui image ready for texture upload.
     ///
     /// This is the per-frame CPU hot path (a full scan for `auto`, then one pass building the
@@ -117,5 +155,27 @@ mod tests {
         let img = f.to_display_image(false, 2.0);
         let p = img.pixels[0];
         assert_eq!((p.r(), p.g(), p.b()), (255, 20, 0));
+    }
+
+    #[test]
+    fn raw_stream_8bit_mono_replicates_gray() {
+        // 2×1 8-bit mono: two gray pixels.
+        let f = Frame::from_raw_stream(&[40, 200], 2, 1, 7).unwrap();
+        assert_eq!((f.width, f.height), (2, 1));
+        assert_eq!(&f.rgba[0..4], &[40, 40, 40, 255]);
+        assert_eq!(&f.rgba[4..8], &[200, 200, 200, 255]);
+    }
+
+    #[test]
+    fn raw_stream_16bit_mono_uses_high_byte() {
+        // 1×1 16-bit LE mono: 0x1234 → high byte 0x12.
+        let f = Frame::from_raw_stream(&[0x34, 0x12], 1, 1, 7).unwrap();
+        assert_eq!(&f.rgba[0..4], &[0x12, 0x12, 0x12, 255]);
+    }
+
+    #[test]
+    fn raw_stream_rejects_mismatched_length() {
+        assert!(Frame::from_raw_stream(&[1, 2, 3], 2, 1, 7).is_err());
+        assert!(Frame::from_raw_stream(&[1, 2], 0, 0, 7).is_err());
     }
 }

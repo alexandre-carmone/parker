@@ -21,6 +21,9 @@ egui = "0.35"
 egui_plot = "0.36"
 arc-swap = "1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# zlib inflate for compressed `.stream.z` raw video frames (the indi crate only base64-decodes
+# BLOBs). Already resolved transitively in Cargo.lock, so this adds no new build.
+flate2 = "1"
 
 [[example]]
 name = "probe"
@@ -29,6 +32,10 @@ path = "examples/probe.rs"
 [[example]]
 name = "guide_check"
 path = "examples/guide_check.rs"
+
+[[example]]
+name = "record_check"
+path = "examples/record_check.rs"
 
 # Live video decoding is numeric-heavy: an unoptimized `image` JPEG decode of an 8 MP frame
 # takes ~3.4 s (0.3 fps), which throttles the stream to a crawl in a plain `cargo run` debug

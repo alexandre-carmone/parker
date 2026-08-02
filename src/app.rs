@@ -6,7 +6,9 @@ use std::sync::atomic::Ordering;
 use eframe::egui;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::bus::{Bus, Command, ConnState, Dir};
+use crate::bus::{
+    Bus, CameraSwitch, Command, ConnState, Dir, RecordConfig, RecordPhase, RecordStatus, RecordStop,
+};
 use crate::guiding::{GuideMode, GuideParams};
 
 const DIRS: [(Dir, &str); 4] = [
@@ -57,6 +59,15 @@ pub struct App {
     /// Show the detected-target / lock-point overlay on the live view.
     detect_overlay: bool,
 
+    // ---- recording (M3) UI state ----
+    /// Stop each video by frame count (true) or by elapsed seconds (false).
+    record_by_frames: bool,
+    record_target_frames: u64,
+    record_target_secs: f64,
+    /// Number of videos in the sequence and the delay (s) between them.
+    record_count: usize,
+    record_delay_secs: f64,
+
     // ---- test/automation hooks (driven by env vars) ----
     autoconnect: bool,
     autostream: bool,
@@ -96,6 +107,11 @@ impl App {
             guide_mode: GuideMode::Disk,
             guide_params: GuideParams::default(),
             detect_overlay: false,
+            record_by_frames: true,
+            record_target_frames: 500,
+            record_target_secs: 30.0,
+            record_count: 1,
+            record_delay_secs: 0.0,
             // A screenshot run implies autoconnect + autostream so there is content to show.
             autoconnect: autoconnect || screenshot_path.is_some(),
             autostream: autoconnect || screenshot_path.is_some(),
@@ -164,6 +180,11 @@ struct Snap {
     sensor_w: u32,
     sensor_h: u32,
     roi: (u32, u32, u32, u32),
+    // recording (M3)
+    stream_switches: Vec<CameraSwitch>,
+    /// Effective streamed bit depth inferred from the raw payload (`None` for MJPEG/unknown).
+    stream_depth: Option<u8>,
+    recording: RecordStatus,
     // guiding (M2)
     guiding: bool,
     calibrating: bool,
@@ -195,6 +216,9 @@ impl App {
             sensor_w: sh.sensor_w,
             sensor_h: sh.sensor_h,
             roi: sh.roi,
+            stream_switches: sh.stream_switches.clone(),
+            stream_depth: stream_depth(&self.bus),
+            recording: sh.recording.clone(),
             guiding: sh.guiding,
             calibrating: sh.calibrating,
             calibrated: sh.calibrated,
@@ -205,6 +229,22 @@ impl App {
             guide_history: sh.guide_history.clone(),
             log_tail: sh.log.iter().rev().take(8).rev().cloned().collect(),
         }
+    }
+}
+
+/// Infer the effective streamed bit depth from the latest raw payload size vs. frame geometry.
+/// `None` when unknown — no raw frame yet, or an MJPEG stream (where `last_raw_len` stays 0).
+fn stream_depth(bus: &Bus) -> Option<u8> {
+    let (w, h) = bus.frame_geometry();
+    let len = bus.last_raw_len();
+    let px = (w as usize).checked_mul(h as usize).unwrap_or(0);
+    if px == 0 || len == 0 {
+        return None;
+    }
+    match len / px {
+        2.. => Some(16),
+        1 => Some(8),
+        _ => None,
     }
 }
 
@@ -301,6 +341,7 @@ impl eframe::App for App {
                     }
                 });
                 ui.separator();
+                self.format_controls(ui, &snap);
                 ui.label("Gain");
                 if ui
                     .add(egui::DragValue::new(&mut self.gain_input).speed(1.0).range(0.0..=1000.0))
@@ -330,6 +371,8 @@ impl eframe::App for App {
                 if let Some(path) = &snap.last_capture {
                     ui.small(format!("saved: {path}"));
                 }
+
+                self.recording_controls(ui, &snap);
 
                 ui.separator();
                 ui.label("Region of interest");
@@ -702,6 +745,134 @@ impl App {
                 ui.add_space(48.0);
                 handle(ui, 1, Dir::South, DIRS[1].1);
             });
+        });
+    }
+
+    /// Stream-format pickers, one per switch property the camera driver exposes (encoder, video
+    /// format, bit depth, sensor mode). These govern the streamed bit depth the SER recorder
+    /// captures — for true 16-bit you typically need the encoder on RAW *and* a 16-bit video
+    /// format/depth. The effective depth is shown live so you can confirm before recording.
+    /// Renders nothing when the driver exposes no such switches.
+    fn format_controls(&mut self, ui: &mut egui::Ui, snap: &Snap) {
+        if snap.stream_switches.is_empty() {
+            return;
+        }
+        egui::Grid::new("format_grid").num_columns(2).show(ui, |ui| {
+            for sw in &snap.stream_switches {
+                ui.label(&sw.label);
+                egui::ComboBox::from_id_salt(&sw.prop)
+                    .selected_text(&sw.selected)
+                    .show_ui(ui, |ui| {
+                        for name in &sw.options {
+                            if ui.selectable_label(*name == sw.selected, name).clicked()
+                                && *name != sw.selected
+                            {
+                                self.send(Command::SetCameraSwitch {
+                                    prop: sw.prop.clone(),
+                                    elem: name.clone(),
+                                });
+                            }
+                        }
+                    });
+                ui.end_row();
+            }
+        });
+        if let Some(depth) = snap.stream_depth {
+            let color = if depth >= 16 {
+                egui::Color32::GREEN
+            } else {
+                egui::Color32::GRAY
+            };
+            ui.colored_label(color, format!("stream depth: {depth}-bit"));
+        }
+        ui.separator();
+    }
+
+    /// Recording / sequence controls: record the live stream to SER — a single video or a timed
+    /// sequence of them (stop each by frame count or duration, with a delay between). Recording
+    /// runs concurrently with guiding.
+    fn recording_controls(&mut self, ui: &mut egui::Ui, snap: &Snap) {
+        let rec = &snap.recording;
+        ui.collapsing("Recording / Sequence", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Stop by:");
+                ui.selectable_value(&mut self.record_by_frames, true, "frames");
+                ui.selectable_value(&mut self.record_by_frames, false, "seconds");
+            });
+            if self.record_by_frames {
+                ui.add(
+                    egui::DragValue::new(&mut self.record_target_frames)
+                        .speed(10.0)
+                        .range(1.0..=1_000_000.0)
+                        .prefix("target: ")
+                        .suffix(" frames"),
+                );
+            } else {
+                ui.add(
+                    egui::DragValue::new(&mut self.record_target_secs)
+                        .speed(0.5)
+                        .range(0.1..=3600.0)
+                        .prefix("target: ")
+                        .suffix(" s"),
+                );
+            }
+            egui::Grid::new("record_seq_grid").num_columns(2).show(ui, |ui| {
+                ui.label("Videos");
+                ui.add(egui::DragValue::new(&mut self.record_count).range(1.0..=1000.0));
+                ui.end_row();
+                ui.label("Delay (s)");
+                ui.add(
+                    egui::DragValue::new(&mut self.record_delay_secs)
+                        .speed(0.5)
+                        .range(0.0..=3600.0),
+                );
+                ui.end_row();
+            });
+
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(snap.streaming && !rec.active, egui::Button::new("⏺ Record"))
+                    .clicked()
+                {
+                    let stop = if self.record_by_frames {
+                        RecordStop::Frames(self.record_target_frames)
+                    } else {
+                        RecordStop::Seconds(self.record_target_secs)
+                    };
+                    self.send(Command::StartRecording(RecordConfig {
+                        dir: self.capture_dir.clone(),
+                        count: self.record_count.max(1),
+                        stop,
+                        delay_secs: self.record_delay_secs,
+                    }));
+                }
+                if ui
+                    .add_enabled(rec.active, egui::Button::new("⏹ Stop"))
+                    .clicked()
+                {
+                    self.send(Command::StopRecording);
+                }
+            });
+
+            if rec.active {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    if rec.phase == RecordPhase::Waiting {
+                        ui.label(format!("waiting… (video {}/{})", rec.current, rec.total));
+                    } else {
+                        ui.label(format!(
+                            "video {}/{} · {} frames · {:.1} s",
+                            rec.current, rec.total, rec.frames_written, rec.elapsed_secs
+                        ));
+                    }
+                });
+            }
+            if rec.dropped > 0 {
+                ui.colored_label(egui::Color32::YELLOW, format!("dropped: {}", rec.dropped));
+            }
+            if let Some(path) = &rec.last_file {
+                ui.small(format!("saved: {path}"));
+            }
         });
     }
 

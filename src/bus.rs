@@ -9,7 +9,9 @@
 //! - worker -> GUI (state): [`Shared`] behind a std `Mutex`, read each repaint.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::fs::File;
+use std::io::BufWriter;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwapOption;
@@ -17,6 +19,7 @@ use egui::ColorImage;
 
 use crate::frame::Frame;
 use crate::guiding::{GuideMode, GuideParams, GuideSample};
+use crate::recorder::SerRecorder;
 
 /// Cardinal nudge directions for manual mount slewing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,6 +56,16 @@ pub enum Command {
     /// Reset the camera readout to the full sensor.
     ResetRoi,
 
+    // ---- recording (M3) ----
+    /// Turn on element `elem` of the camera switch property `prop` — used for the driver's
+    /// stream-format controls (encoder, video format, bit depth, sensor mode). These are
+    /// driver-specific and govern the streamed bit depth the SER recorder captures.
+    SetCameraSwitch { prop: String, elem: String },
+    /// Begin recording the stream to SER — a sequence of `count` videos (see [`RecordConfig`]).
+    StartRecording(RecordConfig),
+    /// Stop recording (finalizing the current SER file).
+    StopRecording,
+
     // ---- guiding (M2) ----
     /// Run the automatic pulse-based calibration (measures the pixel→mount mapping).
     Calibrate,
@@ -68,6 +81,74 @@ pub enum Command {
     SetGuideParams(GuideParams),
     /// Turn per-frame target detection on/off for the on-screen overlay (independent of guiding).
     SetDetectionOverlay(bool),
+}
+
+/// One of the camera's stream-format switch properties (e.g. `CCD_STREAM_ENCODER`,
+/// `CCD_VIDEO_FORMAT`, `STREAM_FULL_DEPTH`, `SENSOR_MODE`) surfaced to the UI so the user can
+/// set the streamed pixel format / bit depth. Names are driver-specific and shown as-is.
+#[derive(Clone, Debug, Default)]
+pub struct CameraSwitch {
+    /// INDI property name (used when sending a change).
+    pub prop: String,
+    /// Human-friendly label for the dropdown.
+    pub label: String,
+    /// Element names (options), sorted.
+    pub options: Vec<String>,
+    /// Currently-selected element name.
+    pub selected: String,
+}
+
+/// What ends each video in a recording sequence.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RecordStop {
+    /// Stop after this many frames have been written.
+    Frames(u64),
+    /// Stop after this many seconds of recording.
+    Seconds(f64),
+}
+
+/// Parameters for a recording run: a sequence of `count` SER videos, each ended by `stop`, with
+/// `delay_secs` of (still-streaming) pause between them.
+#[derive(Clone, Debug)]
+pub struct RecordConfig {
+    /// Output folder for the `.ser` files.
+    pub dir: String,
+    /// Number of videos in the sequence (>= 1).
+    pub count: usize,
+    /// Per-video stop condition.
+    pub stop: RecordStop,
+    /// Delay between consecutive videos (seconds); ignored after the last one.
+    pub delay_secs: f64,
+}
+
+/// Phase of the recording orchestrator, for the UI.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RecordPhase {
+    #[default]
+    Idle,
+    /// Actively writing frames to the current video.
+    Recording,
+    /// Between videos, waiting out the inter-video delay (stream still running).
+    Waiting,
+}
+
+/// Recording progress mirrored to the GUI.
+#[derive(Clone, Debug, Default)]
+pub struct RecordStatus {
+    /// Whether a recording sequence is currently running.
+    pub active: bool,
+    pub phase: RecordPhase,
+    /// 1-based index of the current video and total in the sequence.
+    pub current: usize,
+    pub total: usize,
+    /// Frames written to the current video.
+    pub frames_written: u64,
+    /// Frames skipped because their size didn't match the SER header (e.g. geometry changed).
+    pub dropped: u64,
+    /// Seconds elapsed in the current video.
+    pub elapsed_secs: f64,
+    /// Path of the most recently finalized `.ser` file.
+    pub last_file: Option<String>,
 }
 
 /// Coarse connection lifecycle state shown in the UI.
@@ -103,6 +184,13 @@ pub struct Shared {
     pub sensor_h: u32,
     /// Currently-applied readout region `(x, y, w, h)` in sensor pixels (full sensor by default).
     pub roi: (u32, u32, u32, u32),
+
+    // ---- recording (M3) ----
+    /// The camera's stream-format switch properties (encoder, video format, bit depth, sensor
+    /// mode) that the driver exposes — whichever are present. Populated on connect / camera swap.
+    pub stream_switches: Vec<CameraSwitch>,
+    /// Live recording progress.
+    pub recording: RecordStatus,
 
     // ---- guiding (M2) telemetry, in frame pixels ----
     /// Whether the guide loop is currently running.
@@ -154,6 +242,8 @@ impl Default for Shared {
             sensor_w: 0,
             sensor_h: 0,
             roi: (0, 0, 0, 0),
+            stream_switches: Vec::new(),
+            recording: RecordStatus::default(),
             guiding: false,
             calibrating: false,
             calibrated: false,
@@ -206,6 +296,19 @@ pub struct Bus {
     pub guide_mode: Arc<AtomicU8>,
     /// Bumped on guide start / re-lock to make the Surface detector recapture its reference patch.
     pub ref_generation: Arc<AtomicU64>,
+
+    // ---- recording (M3), read lock-free by the decode thread ----
+    /// Cheap gate: when false the decode thread never touches the recorder mutex.
+    pub recording_active: Arc<AtomicBool>,
+    /// The SER file currently being written (installed by the recording orchestrator). The decode
+    /// thread appends each frame; the orchestrator reads `frame_count` and finalizes.
+    pub recorder: Arc<Mutex<Option<SerRecorder<BufWriter<File>>>>>,
+    /// Current readout geometry, so the decode thread can interpret dimensionless raw frames.
+    pub frame_w: Arc<AtomicU32>,
+    pub frame_h: Arc<AtomicU32>,
+    /// Byte length of the most recent raw (decompressed) frame — lets the orchestrator infer the
+    /// stream's bit depth (bytes-per-pixel) when sizing a new SER file.
+    pub last_raw_len: Arc<AtomicUsize>,
 }
 
 impl Bus {
@@ -221,6 +324,11 @@ impl Bus {
             detect_enabled: Arc::new(AtomicBool::new(false)),
             guide_mode: Arc::new(AtomicU8::new(GuideMode::Disk.as_u8())),
             ref_generation: Arc::new(AtomicU64::new(0)),
+            recording_active: Arc::new(AtomicBool::new(false)),
+            recorder: Arc::new(Mutex::new(None)),
+            frame_w: Arc::new(AtomicU32::new(0)),
+            frame_h: Arc::new(AtomicU32::new(0)),
+            last_raw_len: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -281,6 +389,53 @@ impl Bus {
     /// Decode thread: publish the newest target measurement.
     pub fn publish_guide_sample(&self, sample: GuideSample) {
         self.guide_sample.store(Some(Arc::new(sample)));
+    }
+
+    /// Worker: record the current readout geometry so the decode thread can interpret raw frames.
+    pub fn set_stream_geometry(&self, w: u32, h: u32) {
+        self.frame_w.store(w, Ordering::Relaxed);
+        self.frame_h.store(h, Ordering::Relaxed);
+    }
+
+    /// Decode thread: the current readout geometry `(w, h)` (`(0, 0)` until known).
+    pub fn frame_geometry(&self) -> (u32, u32) {
+        (
+            self.frame_w.load(Ordering::Relaxed),
+            self.frame_h.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Decode thread: remember the newest raw frame's decompressed byte length.
+    pub fn set_last_raw_len(&self, len: usize) {
+        self.last_raw_len.store(len, Ordering::Relaxed);
+    }
+
+    /// Orchestrator: the newest raw frame's decompressed byte length (for bit-depth inference).
+    pub fn last_raw_len(&self) -> usize {
+        self.last_raw_len.load(Ordering::Relaxed)
+    }
+
+    /// Whether the decode thread should append frames to the recorder this frame.
+    pub fn recording_active(&self) -> bool {
+        self.recording_active.load(Ordering::Relaxed)
+    }
+
+    /// Decode thread: append one frame's native payload to the open SER file. A size mismatch
+    /// (e.g. geometry changed mid-recording) is counted as a dropped frame rather than corrupting
+    /// the file. Never holds the recorder and `shared` locks at the same time.
+    pub fn write_record_frame(&self, bytes: &[u8]) {
+        let mismatch = match self.recorder.lock() {
+            Ok(mut guard) => match guard.as_mut() {
+                Some(rec) => rec.write_frame(bytes).is_err(),
+                None => false,
+            },
+            Err(_) => false,
+        };
+        if mismatch {
+            if let Ok(mut sh) = self.shared.lock() {
+                sh.recording.dropped += 1;
+            }
+        }
     }
 }
 

@@ -1,6 +1,7 @@
 //! The async INDI worker: owns the connection/session, decodes the video stream into the
 //! shared frame slot, and translates GUI [`Command`]s into INDI property changes.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -13,12 +14,13 @@ use tokio_stream::StreamExt;
 use indi::client::active_device::ActiveDevice;
 use indi::Parameter; // external crate; `crate::indi` is our local module
 
-use crate::bus::{Bus, Command, ConnState};
+use crate::bus::{Bus, CameraSwitch, Command, ConnState, RecordConfig, RecordPhase, RecordStop};
 use crate::frame::Frame;
 use crate::guiding::{self, GuideDetector, GuideSample};
 use crate::indi::camera::Camera;
 use crate::indi::mount::Mount;
 use crate::indi::Session;
+use crate::recorder::{inflate_zlib, SerColor, SerRecorder};
 
 /// The running guide control loop: its task plus a stop flag it polls each cycle. Dropping the
 /// handle alone would leave the task running, so callers must call [`GuideLoop::shutdown`].
@@ -34,6 +36,13 @@ impl GuideLoop {
     }
 }
 
+/// The running recording orchestrator: its task plus a stop flag it polls between videos and
+/// within each video's frame/time budget.
+struct RecordTask {
+    task: JoinHandle<()>,
+    stop: Arc<AtomicBool>,
+}
+
 /// How often the decode thread runs detection while enabled — enough to feed the few-Hz control
 /// loop and the overlay without doing centroid/NCC work on every high-FPS frame.
 const DETECT_INTERVAL: Duration = Duration::from_millis(100);
@@ -44,6 +53,7 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
     let mut frame_task: Option<FrameStream> = None;
     let mut guide_loop: Option<GuideLoop> = None;
     let mut calib_task: Option<JoinHandle<()>> = None;
+    let mut record_task: Option<RecordTask> = None;
 
     while let Some(cmd) = rx.recv().await {
         match cmd {
@@ -88,6 +98,7 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                             sh.mount_sel = s.mount_name.clone();
                         }
                         init_sensor_size(&s, &bus).await;
+                        init_camera_formats(&s, &bus).await;
                         if let Some(dev) = s.frame_device() {
                             frame_task = spawn_frame_task(dev, bus.clone(), ctx.clone()).await;
                         }
@@ -104,6 +115,7 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
             }
             Command::Disconnect => {
                 stop_guiding(&mut guide_loop, &mut calib_task, &bus);
+                stop_recording(&mut record_task, &bus);
                 if let Some(fs) = frame_task.take() {
                     fs.shutdown();
                 }
@@ -118,6 +130,7 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
             }
             Command::SelectCamera(name) => {
                 stop_guiding(&mut guide_loop, &mut calib_task, &bus);
+                stop_recording(&mut record_task, &bus);
                 match session.as_mut() {
                     Some(s) => match s.select_camera(&name).await {
                         Ok(()) => {
@@ -130,6 +143,7 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                                 sh.fps = 0.0;
                             }
                             init_sensor_size(s, &bus).await;
+                            init_camera_formats(s, &bus).await;
                             if let Some(dev) = s.frame_device() {
                                 frame_task =
                                     spawn_frame_task(dev, bus.clone(), ctx.clone()).await;
@@ -208,16 +222,42 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                 bus.log("guiding stopped");
                 ctx.request_repaint();
             }
+            Command::StartRecording(cfg) => {
+                // Reap a previous sequence that finished on its own (finite frame/time budget),
+                // otherwise its stale handle would look like a still-running recording.
+                if record_task.as_ref().is_some_and(|t| t.task.is_finished()) {
+                    record_task = None;
+                }
+                if record_task.is_some() {
+                    bus.log("already recording");
+                } else if let Some(s) = &session {
+                    start_recording(s, &bus, &ctx, cfg, &mut record_task).await;
+                } else {
+                    bus.log("not connected");
+                }
+                ctx.request_repaint();
+            }
+            Command::StopRecording => {
+                stop_recording(&mut record_task, &bus);
+                bus.log("recording stopped");
+                ctx.request_repaint();
+            }
             other => {
                 // Safety: stopping the stream or changing the ROI invalidates the lock point /
-                // reference patch, so stop guiding before applying such a command.
+                // reference patch, so stop guiding before applying such a command. The same
+                // changes invalidate an in-progress recording's geometry, so stop it too.
                 if matches!(
                     other,
                     Command::StopStream | Command::SetRoi { .. } | Command::ResetRoi
-                ) && guide_loop.is_some()
-                {
-                    stop_guiding(&mut guide_loop, &mut calib_task, &bus);
-                    bus.log("guiding stopped (frame changed)");
+                ) {
+                    if guide_loop.is_some() {
+                        stop_guiding(&mut guide_loop, &mut calib_task, &bus);
+                        bus.log("guiding stopped (frame changed)");
+                    }
+                    if record_task.is_some() {
+                        stop_recording(&mut record_task, &bus);
+                        bus.log("recording stopped (frame changed)");
+                    }
                 }
                 match &session {
                     Some(s) => {
@@ -329,9 +369,44 @@ async fn init_sensor_size(s: &Session, bus: &Bus) {
                 sh.sensor_h = h;
                 sh.roi = (0, 0, w, h);
             }
+            bus.set_stream_geometry(w, h);
             bus.log(format!("sensor: {w}×{h}"));
         }
         Err(e) => bus.log(format!("reading sensor size: {e}")),
+    }
+}
+
+/// Camera switch properties that control the streamed pixel format / bit depth, in UI order.
+/// Whichever the driver exposes are surfaced as dropdowns; names are driver-specific. The depth
+/// that reaches the SER recorder is the product of these — e.g. on Player One you need
+/// `CCD_STREAM_ENCODER=RAW`, `CCD_VIDEO_FORMAT=POA_RAW16`, and `STREAM_FULL_DEPTH=FULL_DEPTH_16BIT`
+/// together for a true 16-bit stream.
+const STREAM_SWITCH_PROPS: &[(&str, &str)] = &[
+    ("CCD_STREAM_ENCODER", "Encoder"),
+    ("CCD_VIDEO_FORMAT", "Video format"),
+    ("STREAM_FULL_DEPTH", "Stream depth"),
+    ("SENSOR_MODE", "Sensor mode"),
+    ("CCD_CAPTURE_FORMAT", "Capture format"),
+];
+
+/// Probe the bound camera's stream-format switch properties into [`Shared`] so the UI pickers can
+/// offer them. Best-effort: properties the driver lacks are simply omitted.
+async fn init_camera_formats(s: &Session, bus: &Bus) {
+    let Some(cam) = s.camera.as_ref() else { return };
+    let mut switches = Vec::new();
+    for (prop, label) in STREAM_SWITCH_PROPS {
+        let (options, selected) = cam.switch_options(prop).await;
+        if !options.is_empty() {
+            switches.push(CameraSwitch {
+                prop: prop.to_string(),
+                label: label.to_string(),
+                options,
+                selected: selected.unwrap_or_default(),
+            });
+        }
+    }
+    if let Ok(mut sh) = bus.shared.lock() {
+        sh.stream_switches = switches;
     }
 }
 
@@ -456,8 +531,8 @@ async fn spawn_frame_task(
             let mut detector = GuideDetector::default();
             let mut last_detect: Option<Instant> = None;
             while let Some(raw) = slot.wait() {
-                match Frame::from_stream_blob(raw.format.as_deref(), &raw.data, seq + 1) {
-                    Ok(frame) => {
+                match decode_frame(&bus, &raw, seq + 1) {
+                    Ok((frame, raw_pixels)) => {
                         seq += 1;
                         let now = Instant::now();
                         if let Ok(mut sh) = bus.shared.lock() {
@@ -494,6 +569,23 @@ async fn spawn_frame_task(
                                 }
                                 if let Ok(mut sh) = bus.shared.lock() {
                                     sh.detected = detected;
+                                }
+                            }
+                        }
+
+                        // Recording: append this frame to the open SER file — native raw bytes
+                        // for a RAW stream, or RGB extracted from the MJPEG-decoded frame. A
+                        // no-op (no lock taken) unless a recording is armed.
+                        if bus.recording_active() {
+                            match &raw_pixels {
+                                Some(bytes) => bus.write_record_frame(bytes),
+                                None => {
+                                    let rgb: Vec<u8> = frame
+                                        .rgba
+                                        .chunks_exact(4)
+                                        .flat_map(|p| [p[0], p[1], p[2]])
+                                        .collect();
+                                    bus.write_record_frame(&rgb);
                                 }
                             }
                         }
@@ -547,6 +639,40 @@ async fn spawn_frame_task(
         decoder,
         slot,
     })
+}
+
+/// Decode one raw video BLOB into a display [`Frame`], and return the native payload to record
+/// when a recording is armed. MJPEG (`.stream_jpg`) is decoded by `image`; RAW streams
+/// (`.stream` / zlib-compressed `.stream.z`) are interpreted using the current readout geometry.
+/// The returned `Option<Vec<u8>>` is the sensor-native bytes to write to SER for a raw stream
+/// (the MJPEG path returns `None` — the caller extracts RGB from the decoded frame instead), and
+/// is only materialized when [`Bus::recording_active`] is set, to keep the non-recording hot path
+/// allocation-free.
+fn decode_frame(bus: &Bus, raw: &RawFrame, seq: u64) -> Result<(Frame, Option<Vec<u8>>)> {
+    let fmt = raw.format.as_deref();
+    let is_jpeg = fmt
+        .map(|f| f.contains("jpg") || f.contains("jpeg"))
+        .unwrap_or(false);
+    if is_jpeg {
+        return Ok((Frame::from_stream_blob(fmt, &raw.data, seq)?, None));
+    }
+
+    let (w, h) = bus.frame_geometry();
+    let (w, h) = (w as usize, h as usize);
+    if fmt.map(|f| f.ends_with(".z")).unwrap_or(false) {
+        // Compressed raw: we must inflate for the display decode anyway, so reuse the buffer.
+        let pixels = inflate_zlib(&raw.data).map_err(|e| anyhow!("inflating raw stream: {e}"))?;
+        bus.set_last_raw_len(pixels.len());
+        let frame = Frame::from_raw_stream(&pixels, w, h, seq)?;
+        let rec = bus.recording_active().then_some(pixels);
+        Ok((frame, rec))
+    } else {
+        bus.set_last_raw_len(raw.data.len());
+        let frame = Frame::from_raw_stream(&raw.data, w, h, seq)?;
+        // Clone the native bytes only when recording is actually running.
+        let rec = bus.recording_active().then(|| raw.data.as_ref().clone());
+        Ok((frame, rec))
+    }
 }
 
 /// Borrow the bound camera, or error if none is selected.
@@ -611,6 +737,25 @@ async fn dispatch(cmd: Command, s: &Session, bus: &Bus) -> Result<()> {
         }
         Command::Abort => mount(s)?.abort().await?,
         Command::CaptureFrame { dir } => capture(bus, &dir)?,
+        Command::SetCameraSwitch { prop, elem } => {
+            let cam = camera(s)?;
+            cam.set_switch(&prop, &elem).await?;
+            // Re-read the switch so the UI reflects the driver's actual state (some options are
+            // interlocked). Also refresh any sibling stream switches that may have changed.
+            for sw_prop in STREAM_SWITCH_PROPS.iter().map(|(p, _)| *p) {
+                let (options, selected) = cam.switch_options(sw_prop).await;
+                if options.is_empty() {
+                    continue;
+                }
+                if let Ok(mut sh) = bus.shared.lock() {
+                    if let Some(sw) = sh.stream_switches.iter_mut().find(|s| s.prop == sw_prop) {
+                        sw.options = options;
+                        sw.selected = selected.unwrap_or_default();
+                    }
+                }
+            }
+            bus.log(format!("{prop} → {elem}"));
+        }
         Command::SetGuideMode(mode) => {
             bus.set_guide_mode(mode);
             bus.bump_ref_generation(); // Surface: recapture reference under the new mode
@@ -652,7 +797,9 @@ async fn dispatch(cmd: Command, s: &Session, bus: &Bus) -> Result<()> {
         | Command::SelectMount(_)
         | Command::Calibrate
         | Command::StartGuiding
-        | Command::StopGuiding => {}
+        | Command::StopGuiding
+        | Command::StartRecording(_)
+        | Command::StopRecording => {}
     }
     Ok(())
 }
@@ -706,6 +853,7 @@ async fn set_roi(s: &Session, bus: &Bus, x: u32, y: u32, w: u32, h: u32) -> Resu
     if let Ok(mut sh) = bus.shared.lock() {
         sh.roi = (x, y, w, h);
     }
+    bus.set_stream_geometry(w, h);
     bus.log(format!("ROI set to {w}×{h} at ({x},{y})"));
     Ok(())
 }
@@ -780,4 +928,242 @@ fn capture(bus: &Bus, dir: &str) -> Result<()> {
     }
     bus.log(format!("captured {path}"));
     Ok(())
+}
+
+/// Begin a recording sequence: require a running stream, capture the camera's Bayer/mono layout
+/// and current encoder, then spawn the orchestrator task.
+async fn start_recording(
+    s: &Session,
+    bus: &Bus,
+    ctx: &egui::Context,
+    cfg: RecordConfig,
+    record_task: &mut Option<RecordTask>,
+) {
+    let (streaming, is_mjpeg) = bus
+        .shared
+        .lock()
+        .map(|sh| {
+            let mjpeg = sh
+                .stream_switches
+                .iter()
+                .find(|s| s.prop == "CCD_STREAM_ENCODER")
+                .map(|s| s.selected.eq_ignore_ascii_case("MJPEG"))
+                .unwrap_or(false);
+            (sh.streaming, mjpeg)
+        })
+        .unwrap_or((false, false));
+    if !streaming {
+        bus.log("start the stream before recording");
+        return;
+    }
+    let Some(cam) = s.camera.as_ref() else {
+        bus.log("no camera selected — cannot record");
+        return;
+    };
+    // Bayer pattern (mono cameras report none → recorded as SER MONO).
+    let cfa = cam.cfa().await;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let (b, c, st) = (bus.clone(), ctx.clone(), stop.clone());
+    let task = tokio::spawn(async move {
+        run_recording(cfg, is_mjpeg, cfa, b, c, st).await;
+    });
+    *record_task = Some(RecordTask { task, stop });
+}
+
+/// Stop the recording orchestrator and finalize any SER file it left open (so it isn't left with
+/// a zero `FrameCount`). Safe to call when not recording.
+fn stop_recording(record_task: &mut Option<RecordTask>, bus: &Bus) {
+    if let Some(t) = record_task.take() {
+        t.stop.store(true, Ordering::Relaxed);
+        t.task.abort();
+    }
+    bus.recording_active.store(false, Ordering::Relaxed);
+    // The orchestrator may have been aborted mid-video; finalize whatever remains installed.
+    let leftover = bus.recorder.lock().ok().and_then(|mut g| g.take());
+    if let Some(rec) = leftover {
+        if let Err(e) = rec.finalize() {
+            bus.log(format!("finalizing SER on stop: {e}"));
+        }
+    }
+    if let Ok(mut sh) = bus.shared.lock() {
+        sh.recording.active = false;
+        sh.recording.phase = RecordPhase::Idle;
+    }
+}
+
+/// Recording orchestrator: writes `cfg.count` SER videos back-to-back, each ended by `cfg.stop`
+/// (a frame count or a duration), with `cfg.delay_secs` between them. The stream keeps running
+/// throughout — only frame *writing* pauses between videos — so guiding stays locked the whole
+/// time.
+async fn run_recording(
+    cfg: RecordConfig,
+    is_mjpeg: bool,
+    cfa: Option<String>,
+    bus: Bus,
+    ctx: egui::Context,
+    stop: Arc<AtomicBool>,
+) {
+    let total = cfg.count.max(1);
+    let dir = PathBuf::from(&cfg.dir);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        bus.log(format!("recording: cannot create {}: {e}", cfg.dir));
+        return;
+    }
+    if let Ok(mut sh) = bus.shared.lock() {
+        sh.recording.active = true;
+        sh.recording.phase = RecordPhase::Recording;
+        sh.recording.current = 0;
+        sh.recording.total = total;
+        sh.recording.frames_written = 0;
+        sh.recording.dropped = 0;
+        sh.recording.elapsed_secs = 0.0;
+    }
+    ctx.request_repaint();
+
+    // Shared filename stem for the whole sequence.
+    let base = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+
+    for i in 1..=total {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        // Wait for a frame so geometry (and, for raw, the payload size → bit depth) is known.
+        let Some((w, h)) = wait_for_geometry(&bus, &stop, Duration::from_secs(5)).await else {
+            bus.log("recording: no frames — is the stream running?");
+            break;
+        };
+        // Choose the SER color layout and bit depth. MJPEG frames are recorded as 8-bit RGB;
+        // raw frames keep the sensor's native depth, inferred from the payload byte length.
+        let (color, depth) = if is_mjpeg {
+            (SerColor::Rgb, 8u8)
+        } else {
+            let color = SerColor::from_cfa(cfa.as_deref());
+            let px = (w as usize) * (h as usize);
+            let bpp = if px > 0 { (bus.last_raw_len() / px).max(1) } else { 1 };
+            (color, if bpp >= 2 { 16u8 } else { 8u8 })
+        };
+
+        let path = dir.join(format!("solar_{base}_{i:03}.ser"));
+        let rec = match SerRecorder::create_file(&path, w, h, color, depth) {
+            Ok(r) => r,
+            Err(e) => {
+                bus.log(format!("recording: {e}"));
+                break;
+            }
+        };
+        if let Ok(mut g) = bus.recorder.lock() {
+            *g = Some(rec);
+        }
+        bus.recording_active.store(true, Ordering::Relaxed);
+        if let Ok(mut sh) = bus.shared.lock() {
+            sh.recording.phase = RecordPhase::Recording;
+            sh.recording.current = i;
+            sh.recording.frames_written = 0;
+            sh.recording.elapsed_secs = 0.0;
+        }
+        bus.log(format!(
+            "recording {i}/{total} ({w}×{h}, {depth}-bit) → {}",
+            path.display()
+        ));
+        ctx.request_repaint();
+
+        // Run until the frame/time budget is met (or a stop is requested), updating progress.
+        let start = Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let stopping = stop.load(Ordering::Relaxed);
+            let frames = bus
+                .recorder
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|r| r.frame_count()))
+                .unwrap_or(0) as u64;
+            let elapsed = start.elapsed().as_secs_f64();
+            if let Ok(mut sh) = bus.shared.lock() {
+                sh.recording.frames_written = frames;
+                sh.recording.elapsed_secs = elapsed;
+            }
+            ctx.request_repaint();
+            let done = match cfg.stop {
+                RecordStop::Frames(n) => frames >= n,
+                RecordStop::Seconds(secs) => elapsed >= secs,
+            };
+            if stopping || done {
+                break;
+            }
+        }
+
+        // Disarm the decode thread and finalize this video.
+        bus.recording_active.store(false, Ordering::Relaxed);
+        let rec = bus.recorder.lock().ok().and_then(|mut g| g.take());
+        if let Some(rec) = rec {
+            match rec.finalize() {
+                Ok(n) => {
+                    let p = path.display().to_string();
+                    if let Ok(mut sh) = bus.shared.lock() {
+                        sh.recording.last_file = Some(p.clone());
+                    }
+                    bus.log(format!("saved {p} ({n} frames)"));
+                }
+                Err(e) => bus.log(format!("finalizing SER: {e}")),
+            }
+        }
+        ctx.request_repaint();
+
+        // Inter-video delay: the stream keeps flowing (guiding stays locked); we just don't write.
+        if i < total && !stop.load(Ordering::Relaxed) && cfg.delay_secs > 0.0 {
+            if let Ok(mut sh) = bus.shared.lock() {
+                sh.recording.phase = RecordPhase::Waiting;
+            }
+            ctx.request_repaint();
+            interruptible_sleep(cfg.delay_secs, &stop).await;
+        }
+    }
+
+    // Sequence finished (or was stopped): clear the active flag; keep `last_file` for the UI.
+    bus.recording_active.store(false, Ordering::Relaxed);
+    if let Ok(mut sh) = bus.shared.lock() {
+        sh.recording.active = false;
+        sh.recording.phase = RecordPhase::Idle;
+    }
+    ctx.request_repaint();
+}
+
+/// Sleep for `secs`, returning early if `stop` is set (checked at ~100 ms granularity).
+async fn interruptible_sleep(secs: f64, stop: &Arc<AtomicBool>) {
+    let deadline = Instant::now() + Duration::from_secs_f64(secs.max(0.0));
+    while Instant::now() < deadline {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Wait until a decoded frame with a known size is available, returning its `(w, h)` in pixels —
+/// or `None` if `stop` fires or `timeout` elapses first.
+async fn wait_for_geometry(
+    bus: &Bus,
+    stop: &Arc<AtomicBool>,
+    timeout: Duration,
+) -> Option<(u32, u32)> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return None;
+        }
+        if let Some(frame) = bus.latest_frame.load_full() {
+            if frame.width > 0 && frame.height > 0 {
+                return Some((frame.width as u32, frame.height as u32));
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

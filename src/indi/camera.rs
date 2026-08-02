@@ -3,7 +3,7 @@
 use anyhow::{anyhow, Result};
 use indi::client::active_device::ActiveDevice;
 use indi::serialization::Sexagesimal;
-use indi::Parameter;
+use indi::{Parameter, SwitchState};
 
 /// Wrapper around the CCD `ActiveDevice` exposing the operations M1 needs.
 pub struct Camera {
@@ -33,6 +33,58 @@ impl Camera {
             tracing::warn!("could not select MJPEG encoder: {e:?}");
         }
         Ok(())
+    }
+
+    /// Turn on `elem` in the switch vector `prop`. Used to drive the driver's stream-format
+    /// switches — which govern the streamed bit depth and are driver-specific. On the Player One
+    /// cameras the ones that matter for 16-bit recording are `CCD_STREAM_ENCODER` (`RAW`),
+    /// `CCD_VIDEO_FORMAT` (`POA_RAW16`), and `STREAM_FULL_DEPTH` (`FULL_DEPTH_16BIT`); `_8BIT`
+    /// there downsamples the client stream even when the sensor format is 16-bit.
+    pub async fn set_switch(&self, prop: &str, elem: &str) -> Result<()> {
+        let _ = self
+            .dev
+            .change(prop, vec![(elem, true)])
+            .await
+            .map_err(|e| anyhow!("setting {prop}={elem}: {e:?}"))?;
+        Ok(())
+    }
+
+    /// Read a switch vector's element names (sorted) and the currently-selected one. Used to
+    /// populate the encoder / capture-format pickers. Returns an empty list if the driver lacks
+    /// the property.
+    pub async fn switch_options(&self, prop: &str) -> (Vec<String>, Option<String>) {
+        let param = match self.dev.get_parameter(prop).await {
+            Ok(p) => p,
+            Err(_) => return (Vec::new(), None),
+        };
+        let guard = param.read().await;
+        if let Parameter::SwitchVector(sv) = &*guard {
+            let mut names: Vec<String> = sv.values.keys().cloned().collect();
+            names.sort();
+            let selected = sv
+                .values
+                .iter()
+                .find(|(_, s)| s.value == SwitchState::On)
+                .map(|(k, _)| k.clone());
+            (names, selected)
+        } else {
+            (Vec::new(), None)
+        }
+    }
+
+    /// Read the sensor's Bayer pattern from `CCD_CFA` (`CFA_TYPE`, e.g. "RGGB"). Absent on mono
+    /// cameras — `None` then means mono, which is what the SER recorder assumes.
+    pub async fn cfa(&self) -> Option<String> {
+        let param = self.dev.get_parameter("CCD_CFA").await.ok()?;
+        let guard = param.read().await;
+        if let Parameter::TextVector(tv) = &*guard {
+            tv.values
+                .get("CFA_TYPE")
+                .map(|t| t.value.clone())
+                .filter(|s| !s.trim().is_empty())
+        } else {
+            None
+        }
     }
 
     /// Set this connection's CCD1 BLOB transport policy (`Never`/`Also`/`Only`). BLOB enable is
