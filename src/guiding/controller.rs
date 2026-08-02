@@ -97,7 +97,7 @@ impl Default for GuideParams {
             aggressiveness: 0.5,
             max_pulse_ms: 500.0,
             min_move_px: 0.5,
-            cadence_ms: 500,
+            cadence_ms: 1000,
         }
     }
 }
