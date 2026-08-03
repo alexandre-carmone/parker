@@ -1,7 +1,6 @@
 //! The async INDI worker: owns the connection/session, decodes the video stream into the
 //! shared frame slot, and translates GUI [`Command`]s into INDI property changes.
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -25,7 +24,7 @@ use crate::guiding::{self, GuideDetector, GuideSample};
 use crate::indi::camera::Camera;
 use crate::indi::mount::Mount;
 use crate::indi::Session;
-use crate::recorder::{inflate_zlib, SerColor, SerRecorder};
+use crate::recorder::inflate_zlib;
 
 /// The running guide control loop: its task plus a stop flag it polls each cycle. Dropping the
 /// handle alone would leave the task running, so callers must call [`GuideLoop::shutdown`].
@@ -1382,8 +1381,12 @@ fn capture(bus: &Bus, dir: &str) -> Result<()> {
     Ok(())
 }
 
-/// Begin a recording sequence: require a running stream, capture the camera's Bayer/mono layout
-/// and current encoder, then spawn the orchestrator task.
+/// Begin a recording sequence by spawning the orchestrator task with its own camera handle so it
+/// can drive the driver's `RECORD_STREAM` control while the command loop stays responsive.
+///
+/// Driver-side recording does **not** require the client's live stream: the driver runs its own
+/// capture loop when `RECORD_*_ON` is set. So this only needs a connected camera — recording works
+/// whether or not the app is streaming for live view / guiding.
 async fn start_recording(
     s: &Session,
     bus: &Bus,
@@ -1391,52 +1394,29 @@ async fn start_recording(
     cfg: RecordConfig,
     record_task: &mut Option<RecordTask>,
 ) {
-    let (streaming, is_mjpeg) = bus
-        .shared
-        .lock()
-        .map(|sh| {
-            let mjpeg = sh
-                .stream_switches
-                .iter()
-                .find(|s| s.prop == "CCD_STREAM_ENCODER")
-                .map(|s| s.selected.eq_ignore_ascii_case("MJPEG"))
-                .unwrap_or(false);
-            (sh.streaming, mjpeg)
-        })
-        .unwrap_or((false, false));
-    if !streaming {
-        bus.log("start the stream before recording");
-        return;
-    }
     let Some(cam) = s.camera.as_ref() else {
         bus.log("no camera selected — cannot record");
         return;
     };
-    // Bayer pattern (mono cameras report none → recorded as SER MONO).
-    let cfa = cam.cfa().await;
+    // A second, independent handle into the same device store (ActiveDevice is Clone), for the
+    // orchestrator task — mirrors Session::clone_mount for the guide loop.
+    let cam = Camera::new(cam.dev.clone());
 
     let stop = Arc::new(AtomicBool::new(false));
     let (b, c, st) = (bus.clone(), ctx.clone(), stop.clone());
     let task = tokio::spawn(async move {
-        run_recording(cfg, is_mjpeg, cfa, b, c, st).await;
+        run_recording(cfg, cam, b, c, st).await;
     });
     *record_task = Some(RecordTask { task, stop });
 }
 
-/// Stop the recording orchestrator and finalize any SER file it left open (so it isn't left with
-/// a zero `FrameCount`). Safe to call when not recording.
+/// Request the recording orchestrator to stop. We only raise the stop flag — we deliberately do
+/// **not** abort the task, so it stays alive long enough to send `RECORD_OFF` to the driver and
+/// clear its own state. Safe to call when not recording. The optimistic `Shared` clear here just
+/// updates the UI immediately; the task also clears it on exit.
 fn stop_recording(record_task: &mut Option<RecordTask>, bus: &Bus) {
     if let Some(t) = record_task.take() {
         t.stop.store(true, Ordering::Relaxed);
-        t.task.abort();
-    }
-    bus.recording_active.store(false, Ordering::Relaxed);
-    // The orchestrator may have been aborted mid-video; finalize whatever remains installed.
-    let leftover = bus.recorder.lock().ok().and_then(|mut g| g.take());
-    if let Some(rec) = leftover {
-        if let Err(e) = rec.finalize() {
-            bus.log(format!("finalizing SER on stop: {e}"));
-        }
     }
     if let Ok(mut sh) = bus.shared.lock() {
         sh.recording.active = false;
@@ -1444,36 +1424,32 @@ fn stop_recording(record_task: &mut Option<RecordTask>, bus: &Bus) {
     }
 }
 
-/// Recording orchestrator: writes `cfg.count` SER videos back-to-back, each ended by `cfg.stop`
-/// (a frame count or a duration), with `cfg.delay_secs` between them. The stream keeps running
-/// throughout — only frame *writing* pauses between videos — so guiding stays locked the whole
-/// time.
+/// Recording orchestrator: drives the **driver's** `RECORD_STREAM` control to write `cfg.count`
+/// videos back-to-back, each ended by `cfg.stop` (a frame count or a duration), with
+/// `cfg.delay_secs` between them. The driver writes the SER file on the indiserver host; the stream
+/// keeps running throughout so guiding stays locked the whole time. Only the stop flag can
+/// interrupt it — see [`stop_recording`].
 async fn run_recording(
     cfg: RecordConfig,
-    is_mjpeg: bool,
-    cfa: Option<String>,
+    cam: Camera,
     bus: Bus,
     ctx: egui::Context,
     stop: Arc<AtomicBool>,
 ) {
     let total = cfg.count.max(1);
-    let dir = PathBuf::from(&cfg.dir);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        bus.log(format!("recording: cannot create {}: {e}", cfg.dir));
-        return;
-    }
     if let Ok(mut sh) = bus.shared.lock() {
         sh.recording.active = true;
         sh.recording.phase = RecordPhase::Recording;
         sh.recording.current = 0;
         sh.recording.total = total;
-        sh.recording.frames_written = 0;
+        sh.recording.frames_written = 0; // not reported by the driver
         sh.recording.dropped = 0;
         sh.recording.elapsed_secs = 0.0;
     }
     ctx.request_repaint();
 
-    // Shared filename stem for the whole sequence.
+    // Shared filename stem for the whole sequence. We use a literal (client-side) timestamp rather
+    // than the driver's `_D_`/`_T_` templates so the reported path matches what's actually written.
     let base = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -1483,90 +1459,72 @@ async fn run_recording(
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        // Wait for a frame so geometry (and, for raw, the payload size → bit depth) is known.
-        let Some((w, h)) = wait_for_geometry(&bus, &stop, Duration::from_secs(5)).await else {
-            bus.log("recording: no frames — is the stream running?");
+        let name = format!("solar_{base}_{i:03}");
+        if let Err(e) = cam.set_record_file(&cfg.dir, &name).await {
+            bus.log(format!("recording: {e}"));
             break;
-        };
-        // Choose the SER color layout and bit depth. MJPEG frames are recorded as 8-bit RGB;
-        // raw frames keep the sensor's native depth, inferred from the payload byte length.
-        let (color, depth) = if is_mjpeg {
-            (SerColor::Rgb, 8u8)
-        } else {
-            let color = SerColor::from_cfa(cfa.as_deref());
-            let px = (w as usize) * (h as usize);
-            let bpp = if px > 0 { (bus.last_raw_len() / px).max(1) } else { 1 };
-            (color, if bpp >= 2 { 16u8 } else { 8u8 })
-        };
-
-        let path = dir.join(format!("solar_{base}_{i:03}.ser"));
-        let rec = match SerRecorder::create_file(&path, w, h, color, depth) {
-            Ok(r) => r,
-            Err(e) => {
-                bus.log(format!("recording: {e}"));
-                break;
+        }
+        // Set only the budget element that matches the chosen mode, then start that mode. Sending
+        // the sibling element (as 0) would make the driver reject RECORD_OPTIONS.
+        let (budget, started) = match cfg.stop {
+            RecordStop::Frames(n) => {
+                if let Err(e) = cam.set_record_frame_total(n).await {
+                    bus.log(format!("recording: {e}"));
+                    break;
+                }
+                (format!("{n} frames"), cam.record_start_frames().await)
+            }
+            RecordStop::Seconds(s) => {
+                if let Err(e) = cam.set_record_duration(s).await {
+                    bus.log(format!("recording: {e}"));
+                    break;
+                }
+                (format!("{s} s"), cam.record_start_duration().await)
             }
         };
-        if let Ok(mut g) = bus.recorder.lock() {
-            *g = Some(rec);
+        if let Err(e) = started {
+            bus.log(format!("recording: {e}"));
+            break;
         }
-        bus.recording_active.store(true, Ordering::Relaxed);
         if let Ok(mut sh) = bus.shared.lock() {
             sh.recording.phase = RecordPhase::Recording;
             sh.recording.current = i;
-            sh.recording.frames_written = 0;
             sh.recording.elapsed_secs = 0.0;
         }
-        bus.log(format!(
-            "recording {i}/{total} ({w}×{h}, {depth}-bit) → {}",
-            path.display()
-        ));
+        bus.log(format!("recording {i}/{total} ({budget}) → {}/{name}.ser", cfg.dir));
         ctx.request_repaint();
 
-        // Run until the frame/time budget is met (or a stop is requested), updating progress.
+        // Phase 1: wait for the driver to actually enter the recording state, so the pre-start
+        // `RECORD_OFF=On` isn't misread as an instant completion. Phase 2: run until the driver
+        // auto-stops on its budget, or a stop is requested — updating elapsed time as we go.
+        let armed = wait_for_record_state(&cam, &stop, true, Duration::from_secs(2)).await;
         let start = Instant::now();
-        loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let stopping = stop.load(Ordering::Relaxed);
-            let frames = bus
-                .recorder
-                .lock()
-                .ok()
-                .and_then(|g| g.as_ref().map(|r| r.frame_count()))
-                .unwrap_or(0) as u64;
-            let elapsed = start.elapsed().as_secs_f64();
-            if let Ok(mut sh) = bus.shared.lock() {
-                sh.recording.frames_written = frames;
-                sh.recording.elapsed_secs = elapsed;
+        if armed {
+            loop {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let stopping = stop.load(Ordering::Relaxed);
+                if let Ok(mut sh) = bus.shared.lock() {
+                    sh.recording.elapsed_secs = start.elapsed().as_secs_f64();
+                }
+                ctx.request_repaint();
+                if stopping || !cam.record_is_running().await {
+                    break;
+                }
             }
-            ctx.request_repaint();
-            let done = match cfg.stop {
-                RecordStop::Frames(n) => frames >= n,
-                RecordStop::Seconds(secs) => elapsed >= secs,
-            };
-            if stopping || done {
-                break;
-            }
+        }
+        // Ensure the driver is stopped (no-op if it already auto-stopped on its budget).
+        if let Err(e) = cam.record_stop().await {
+            bus.log(format!("recording: stopping driver: {e}"));
         }
 
-        // Disarm the decode thread and finalize this video.
-        bus.recording_active.store(false, Ordering::Relaxed);
-        let rec = bus.recorder.lock().ok().and_then(|mut g| g.take());
-        if let Some(rec) = rec {
-            match rec.finalize() {
-                Ok(n) => {
-                    let p = path.display().to_string();
-                    if let Ok(mut sh) = bus.shared.lock() {
-                        sh.recording.last_file = Some(p.clone());
-                    }
-                    bus.log(format!("saved {p} ({n} frames)"));
-                }
-                Err(e) => bus.log(format!("finalizing SER: {e}")),
-            }
+        let saved = format!("{}/{name}.ser", cfg.dir);
+        if let Ok(mut sh) = bus.shared.lock() {
+            sh.recording.last_file = Some(saved.clone());
         }
+        bus.log(format!("saved {saved} (on INDI server host)"));
         ctx.request_repaint();
 
-        // Inter-video delay: the stream keeps flowing (guiding stays locked); we just don't write.
+        // Inter-video delay: the stream keeps flowing (guiding stays locked); we just don't record.
         if i < total && !stop.load(Ordering::Relaxed) && cfg.delay_secs > 0.0 {
             if let Ok(mut sh) = bus.shared.lock() {
                 sh.recording.phase = RecordPhase::Waiting;
@@ -1577,7 +1535,6 @@ async fn run_recording(
     }
 
     // Sequence finished (or was stopped): clear the active flag; keep `last_file` for the UI.
-    bus.recording_active.store(false, Ordering::Relaxed);
     if let Ok(mut sh) = bus.shared.lock() {
         sh.recording.active = false;
         sh.recording.phase = RecordPhase::Idle;
@@ -1596,25 +1553,24 @@ async fn interruptible_sleep(secs: f64, stop: &Arc<AtomicBool>) {
     }
 }
 
-/// Wait until a decoded frame with a known size is available, returning its `(w, h)` in pixels —
-/// or `None` if `stop` fires or `timeout` elapses first.
-async fn wait_for_geometry(
-    bus: &Bus,
+/// Poll the driver's `RECORD_STREAM` state until it equals `want` (`true` = recording), returning
+/// whether that state was reached before `stop` fired or `timeout` elapsed.
+async fn wait_for_record_state(
+    cam: &Camera,
     stop: &Arc<AtomicBool>,
+    want: bool,
     timeout: Duration,
-) -> Option<(u32, u32)> {
+) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
         if stop.load(Ordering::Relaxed) {
-            return None;
+            return false;
         }
-        if let Some(frame) = bus.latest_frame.load_full() {
-            if frame.width > 0 && frame.height > 0 {
-                return Some((frame.width as u32, frame.height as u32));
-            }
+        if cam.record_is_running().await == want {
+            return true;
         }
         if Instant::now() >= deadline {
-            return None;
+            return false;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

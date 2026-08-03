@@ -167,6 +167,97 @@ impl Camera {
         Ok(())
     }
 
+    /// Set the driver's frame-count budget (`RECORD_OPTIONS.RECORD_FRAME_TOTAL`) for a subsequent
+    /// [`record_start_frames`](Self::record_start_frames). Sends **only** this element: including
+    /// the sibling `RECORD_DURATION` (e.g. as 0) makes drivers reject the whole vector as
+    /// out-of-range, flipping `RECORD_OPTIONS` to `Alert` — surfaced by the crate as a
+    /// `PropertyError`.
+    pub async fn set_record_frame_total(&self, frames: u64) -> Result<()> {
+        let _ = self
+            .dev
+            .change(
+                "RECORD_OPTIONS",
+                vec![("RECORD_FRAME_TOTAL", Sexagesimal::from(frames as f64))],
+            )
+            .await
+            .map_err(|e| anyhow!("setting record frame total: {e:?}"))?;
+        Ok(())
+    }
+
+    /// Set the driver's duration budget (`RECORD_OPTIONS.RECORD_DURATION`, seconds) for a
+    /// subsequent [`record_start_duration`](Self::record_start_duration). Sends only this element,
+    /// for the same reason as [`set_record_frame_total`](Self::set_record_frame_total).
+    pub async fn set_record_duration(&self, seconds: f64) -> Result<()> {
+        let _ = self
+            .dev
+            .change("RECORD_OPTIONS", vec![("RECORD_DURATION", Sexagesimal::from(seconds))])
+            .await
+            .map_err(|e| anyhow!("setting record duration: {e:?}"))?;
+        Ok(())
+    }
+
+    /// Set where the driver writes the recording (`RECORD_FILE`). The path is on the **indiserver
+    /// host**, not the client. `name` may use the driver's filename templates (`_D_` date,
+    /// `_T_` time). The extension (`.ser`) is added by the driver.
+    pub async fn set_record_file(&self, dir: &str, name: &str) -> Result<()> {
+        let _ = self
+            .dev
+            .change("RECORD_FILE", vec![("RECORD_FILE_DIR", dir), ("RECORD_FILE_NAME", name)])
+            .await
+            .map_err(|e| anyhow!("setting record file: {e:?}"))?;
+        Ok(())
+    }
+
+    /// Start a frame-count-limited driver recording (`RECORD_STREAM.RECORD_FRAME_ON`), stopping
+    /// after `RECORD_FRAME_TOTAL` frames. See [`toggle_record`](Self::toggle_record) for why this
+    /// is fire-and-forget.
+    pub async fn record_start_frames(&self) -> Result<()> {
+        self.toggle_record("RECORD_FRAME_ON").await
+    }
+
+    /// Start a duration-limited driver recording (`RECORD_STREAM.RECORD_DURATION_ON`), stopping
+    /// after `RECORD_DURATION` seconds.
+    pub async fn record_start_duration(&self) -> Result<()> {
+        self.toggle_record("RECORD_DURATION_ON").await
+    }
+
+    /// Stop the driver recording (`RECORD_STREAM.RECORD_OFF`). Best-effort.
+    pub async fn record_stop(&self) -> Result<()> {
+        self.toggle_record("RECORD_OFF").await
+    }
+
+    /// Fire-and-forget a `RECORD_STREAM` switch element. Uses `set` (send-and-return) rather than
+    /// `change` (send-and-wait) for the same reason as [`toggle_stream`](Self::toggle_stream): an
+    /// active recording holds `RECORD_STREAM` in `Busy` for its whole duration, so `change` — which
+    /// waits for the property to leave `Busy` — would time out even though the switch took effect.
+    async fn toggle_record(&self, element: &str) -> Result<()> {
+        self.dev
+            .parameter("RECORD_STREAM")
+            .await
+            .map_err(|e| anyhow!("finding RECORD_STREAM: {e:?}"))?
+            .set(vec![(element, true)])
+            .map_err(|e| anyhow!("toggling record ({element}): {e:?}"))?;
+        Ok(())
+    }
+
+    /// Whether the driver is currently recording, read from `RECORD_STREAM`: true while
+    /// `RECORD_OFF` is `Off`. Used to detect the driver's auto-stop on the frame/duration budget.
+    /// Returns `false` if the property is absent or unreadable.
+    pub async fn record_is_running(&self) -> bool {
+        let Ok(param) = self.dev.get_parameter("RECORD_STREAM").await else {
+            return false;
+        };
+        let guard = param.read().await;
+        if let Parameter::SwitchVector(sv) = &*guard {
+            sv.values
+                .get("RECORD_OFF")
+                .map(|s| s.value == SwitchState::Off)
+                .unwrap_or(false)
+        } else {
+            false
+        }
+    }
+
     /// Raise the driver's client preview-FPS cap (`LIMITS.LIMITS_PREVIEW_FPS`) to its maximum so
     /// every captured frame is delivered. Drivers often default this to ~10, which throttles both
     /// the live view and recording. We set the property's own advertised max (rather than an

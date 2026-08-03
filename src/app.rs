@@ -1081,8 +1081,13 @@ impl App {
             });
 
             ui.horizontal(|ui| {
+                // Driver-side recording is independent of the client stream — the driver captures
+                // and writes on its own — so this needs a connected camera, not an active stream.
+                let can_record = snap.conn == ConnState::Connected
+                    && !snap.camera_sel.is_empty()
+                    && !rec.active;
                 if ui
-                    .add_enabled(snap.streaming && !rec.active, egui::Button::new("⏺ Record"))
+                    .add_enabled(can_record, egui::Button::new("⏺ Record"))
                     .clicked()
                 {
                     let stop = if self.record_by_frames {
@@ -1111,19 +1116,19 @@ impl App {
                     if rec.phase == RecordPhase::Waiting {
                         ui.label(format!("waiting… (video {}/{})", rec.current, rec.total));
                     } else {
+                        // The driver writes the file server-side and doesn't report a live frame
+                        // count, so progress is video index + elapsed time.
                         ui.label(format!(
-                            "video {}/{} · {} frames · {:.1} s",
-                            rec.current, rec.total, rec.frames_written, rec.elapsed_secs
+                            "video {}/{} · {:.1} s",
+                            rec.current, rec.total, rec.elapsed_secs
                         ));
                     }
                 });
             }
-            if rec.dropped > 0 {
-                ui.colored_label(egui::Color32::YELLOW, format!("dropped: {}", rec.dropped));
-            }
             if let Some(path) = &rec.last_file {
                 ui.small(format!("saved: {path}"));
             }
+            ui.small("Recorded by the INDI driver on the server host, under the capture dir.");
         });
     }
 
