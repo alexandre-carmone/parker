@@ -12,9 +12,14 @@ use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
 use indi::client::active_device::ActiveDevice;
-use indi::Parameter; // external crate; `crate::indi` is our local module
+use indi::serialization::Sexagesimal;
+use indi::{Parameter, PropertyPerm, PropertyState, SwitchRule, SwitchState}; // external crate; `crate::indi` is our local module
 
-use crate::bus::{Bus, CameraSwitch, Command, ConnState, RecordConfig, RecordPhase, RecordStop};
+use crate::bus::{
+    Bus, CameraSwitch, Command, ConnState, IndiGroup, IndiLight, IndiNumber, IndiPanel, IndiProp,
+    IndiState, IndiSwitch, IndiSwitchRule, IndiText, IndiValue, RecordConfig, RecordPhase,
+    RecordStop,
+};
 use crate::frame::Frame;
 use crate::guiding::{self, GuideDetector, GuideSample};
 use crate::indi::camera::Camera;
@@ -60,7 +65,25 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
     let mut calib_task: Option<JoinHandle<()>> = None;
     let mut record_task: Option<RecordTask> = None;
 
-    while let Some(cmd) = rx.recv().await {
+    // Periodic tick that re-mirrors the bound devices' full property trees into `Shared` so the
+    // generic INDI control panel shows live values (temperature, cooler, coords, …).
+    let mut panel_refresh = tokio::time::interval(Duration::from_millis(1000));
+    panel_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        let cmd = tokio::select! {
+            maybe_cmd = rx.recv() => match maybe_cmd {
+                Some(cmd) => cmd,
+                None => break, // command channel closed
+            },
+            _ = panel_refresh.tick() => {
+                if let Some(s) = &session {
+                    refresh_panels(s, &bus).await;
+                    ctx.request_repaint();
+                }
+                continue;
+            }
+        };
         match cmd {
             Command::Connect { addr } => {
                 if let Some(fs) = frame_task.take() {
@@ -104,6 +127,7 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                         }
                         init_sensor_size(&s, &bus).await;
                         init_camera_formats(&s, &bus).await;
+                        refresh_panels(&s, &bus).await;
                         if let Some(dev) = s.frame_device() {
                             frame_task = spawn_frame_task(dev, bus.clone(), ctx.clone()).await;
                         }
@@ -149,6 +173,7 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                             }
                             init_sensor_size(s, &bus).await;
                             init_camera_formats(s, &bus).await;
+                            refresh_panels(s, &bus).await;
                             if let Some(dev) = s.frame_device() {
                                 frame_task =
                                     spawn_frame_task(dev, bus.clone(), ctx.clone()).await;
@@ -181,6 +206,7 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                                 sh.mount_sel = name.clone();
                                 sh.tracking = false;
                             }
+                            refresh_panels(s, &bus).await;
                             bus.log(format!("mount: {name}"));
                         }
                         Err(e) => bus.log(format!("select mount failed: {e}")),
@@ -413,6 +439,201 @@ async fn init_camera_formats(s: &Session, bus: &Bus) {
     }
     if let Ok(mut sh) = bus.shared.lock() {
         sh.stream_switches = switches;
+    }
+}
+
+/// Re-mirror the bound camera's and mount's full property trees into [`Shared`] for the generic
+/// INDI control panel. Cheap enough to run on the ~1 Hz tick and after each generic write.
+async fn refresh_panels(s: &Session, bus: &Bus) {
+    let camera = match s.camera.as_ref() {
+        Some(cam) => Some(Arc::new(snapshot_panel(&cam.dev).await)),
+        None => None,
+    };
+    let mount = match s.mount.as_ref() {
+        Some(m) => Some(Arc::new(snapshot_panel(&m.dev).await)),
+        None => None,
+    };
+    if let Ok(mut sh) = bus.shared.lock() {
+        sh.camera_panel = camera;
+        sh.mount_panel = mount;
+    }
+}
+
+/// Map an INDI `PropertyState` to the panel's LED state.
+fn state_of(s: &PropertyState) -> IndiState {
+    match s {
+        PropertyState::Idle => IndiState::Idle,
+        PropertyState::Ok => IndiState::Ok,
+        PropertyState::Busy => IndiState::Busy,
+        PropertyState::Alert => IndiState::Alert,
+    }
+}
+
+/// Snapshot a device's entire property tree into the plain [`IndiPanel`] mirror, grouped by INDI
+/// group (preserving the driver's group order and within-group property order).
+async fn snapshot_panel(dev: &ActiveDevice) -> IndiPanel {
+    // A single per-lock read timeout: a generic panel walks *every* property of an arbitrary
+    // driver, so one property whose read-lock is momentarily (or indefinitely) held must not stall
+    // the whole snapshot — and, via the connect/tick call sites, the worker's command loop.
+    const READ_TIMEOUT: Duration = Duration::from_millis(500);
+
+    // Copy the metadata we need while holding the device guard, then read each parameter without
+    // holding the device lock across the inner awaits (mirrors `device_interfaces`).
+    let Ok(meta) = tokio::time::timeout(READ_TIMEOUT, async {
+        let guard = dev.read().await;
+        (
+            guard.get_name().clone(),
+            guard.parameter_groups().clone(),
+            guard.parameter_names().clone(),
+            guard.get_parameters().clone(),
+        )
+    })
+    .await
+    else {
+        tracing::warn!("indi panel: reading device metadata timed out");
+        return IndiPanel::default();
+    };
+    let (device, group_order, name_order, params) = meta;
+
+    // Build props keyed by group, preserving `name_order` within each group.
+    let mut by_group: std::collections::HashMap<String, Vec<IndiProp>> =
+        std::collections::HashMap::new();
+    for name in &name_order {
+        let Some(handle) = params.get(name) else { continue };
+        let param = match tokio::time::timeout(READ_TIMEOUT, handle.read()).await {
+            Ok(param) => param,
+            Err(_) => {
+                tracing::warn!("indi panel: reading '{name}' on {device} timed out; skipping");
+                continue;
+            }
+        };
+        let group = param.get_group().clone().unwrap_or_default();
+        let prop = IndiProp {
+            name: param.get_name().clone(),
+            label: param.get_label_display().clone(),
+            state: state_of(param.get_state()),
+            writable: false, // set per-type below (lights are always read-only)
+            value: IndiValue::Blob(Vec::new()),
+        };
+        if let Some(prop) = build_prop(prop, &param) {
+            by_group.entry(group).or_default().push(prop);
+        }
+    }
+
+    // Emit groups in the driver's declared order; append any groups not listed (defensive).
+    let mut order: Vec<String> = group_order;
+    for g in by_group.keys() {
+        if !order.iter().any(|x| x == g) {
+            order.push(g.clone());
+        }
+    }
+    let mut groups: Vec<IndiGroup> = Vec::new();
+    for g in order {
+        if let Some(props) = by_group.remove(&g) {
+            groups.push(IndiGroup { name: g, props });
+        }
+    }
+
+    let prop_count: usize = groups.iter().map(|g| g.props.len()).sum();
+    tracing::debug!(
+        "indi panel: {device} → {} group(s), {prop_count} prop(s)",
+        groups.len()
+    );
+    IndiPanel { device, groups }
+}
+
+/// Fill a partially-built [`IndiProp`] from a `Parameter`, returning `None` for kinds we don't
+/// render. `writable` follows the property permission (`RW`/`WO`); lights are always read-only.
+fn build_prop(mut prop: IndiProp, param: &Parameter) -> Option<IndiProp> {
+    let writable = |perm: &PropertyPerm| matches!(perm, PropertyPerm::RW | PropertyPerm::WO);
+    match param {
+        Parameter::NumberVector(nv) => {
+            prop.writable = writable(&nv.perm);
+            let mut items: Vec<IndiNumber> = nv
+                .values
+                .iter()
+                .map(|(name, n)| IndiNumber {
+                    name: name.clone(),
+                    label: n.label.clone().unwrap_or_else(|| name.clone()),
+                    value: f64::from(n.value),
+                    min: n.min,
+                    max: n.max,
+                    step: n.step,
+                    format: n.format.clone(),
+                })
+                .collect();
+            items.sort_by(|a, b| a.name.cmp(&b.name));
+            prop.value = IndiValue::Number(items);
+        }
+        Parameter::SwitchVector(sv) => {
+            prop.writable = writable(&sv.perm);
+            let rule = match sv.rule {
+                SwitchRule::OneOfMany => IndiSwitchRule::OneOfMany,
+                SwitchRule::AtMostOne => IndiSwitchRule::AtMostOne,
+                SwitchRule::AnyOfMany => IndiSwitchRule::AnyOfMany,
+            };
+            let mut items: Vec<IndiSwitch> = sv
+                .values
+                .iter()
+                .map(|(name, sw)| IndiSwitch {
+                    name: name.clone(),
+                    label: sw.label.clone().unwrap_or_else(|| name.clone()),
+                    on: sw.value == SwitchState::On,
+                })
+                .collect();
+            items.sort_by(|a, b| a.name.cmp(&b.name));
+            prop.value = IndiValue::Switch { rule, items };
+        }
+        Parameter::TextVector(tv) => {
+            prop.writable = writable(&tv.perm);
+            let mut items: Vec<IndiText> = tv
+                .values
+                .iter()
+                .map(|(name, t)| IndiText {
+                    name: name.clone(),
+                    label: t.label.clone().unwrap_or_else(|| name.clone()),
+                    value: t.value.clone(),
+                })
+                .collect();
+            items.sort_by(|a, b| a.name.cmp(&b.name));
+            prop.value = IndiValue::Text(items);
+        }
+        Parameter::LightVector(lv) => {
+            prop.writable = false;
+            let mut items: Vec<IndiLight> = lv
+                .values
+                .iter()
+                .map(|(name, l)| IndiLight {
+                    name: name.clone(),
+                    label: l.label.clone().unwrap_or_else(|| name.clone()),
+                    state: state_of(&l.value),
+                })
+                .collect();
+            items.sort_by(|a, b| a.name.cmp(&b.name));
+            prop.value = IndiValue::Light(items);
+        }
+        Parameter::BlobVector(bv) => {
+            prop.writable = false;
+            let mut labels: Vec<String> = bv
+                .values
+                .iter()
+                .map(|(name, b)| b.label.clone().unwrap_or_else(|| name.clone()))
+                .collect();
+            labels.sort();
+            prop.value = IndiValue::Blob(labels);
+        }
+    }
+    Some(prop)
+}
+
+/// Resolve a device name to the bound camera's or mount's `ActiveDevice`, for generic writes.
+fn device_by_name<'a>(s: &'a Session, name: &str) -> Option<&'a ActiveDevice> {
+    if s.camera_name == name {
+        s.camera.as_ref().map(|c| &c.dev)
+    } else if s.mount_name == name {
+        s.mount.as_ref().map(|m| &m.dev)
+    } else {
+        None
     }
 }
 
@@ -923,6 +1144,59 @@ async fn dispatch(cmd: Command, s: &Session, bus: &Bus) -> Result<()> {
                 return Err(anyhow!("sensor size unknown; cannot reset ROI"));
             }
             set_roi(s, bus, 0, 0, w, h).await?;
+        }
+        Command::SetIndiSwitch {
+            device,
+            prop,
+            elems,
+        } => {
+            let dev = device_by_name(s, &device)
+                .ok_or_else(|| anyhow!("unknown device {device}"))?;
+            // Fire-and-forget: `change` would wait for Busy→Ok and hang on streaming/slewing props.
+            let values: Vec<(&str, bool)> =
+                elems.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+            dev.parameter(&prop)
+                .await
+                .map_err(|e| anyhow!("{prop}: {e:?}"))?
+                .set(values)
+                .map_err(|e| anyhow!("setting {prop}: {e:?}"))?;
+            refresh_panels(s, bus).await;
+        }
+        Command::SetIndiNumber {
+            device,
+            prop,
+            elems,
+        } => {
+            let dev = device_by_name(s, &device)
+                .ok_or_else(|| anyhow!("unknown device {device}"))?;
+            let values: Vec<(&str, Sexagesimal)> = elems
+                .iter()
+                .map(|(n, v)| (n.as_str(), Sexagesimal::from(*v)))
+                .collect();
+            dev.parameter(&prop)
+                .await
+                .map_err(|e| anyhow!("{prop}: {e:?}"))?
+                .set(values)
+                .map_err(|e| anyhow!("setting {prop}: {e:?}"))?;
+            refresh_panels(s, bus).await;
+        }
+        Command::SetIndiText {
+            device,
+            prop,
+            elems,
+        } => {
+            let dev = device_by_name(s, &device)
+                .ok_or_else(|| anyhow!("unknown device {device}"))?;
+            let values: Vec<(&str, &str)> = elems
+                .iter()
+                .map(|(n, v)| (n.as_str(), v.as_str()))
+                .collect();
+            dev.parameter(&prop)
+                .await
+                .map_err(|e| anyhow!("{prop}: {e:?}"))?
+                .set(values)
+                .map_err(|e| anyhow!("setting {prop}: {e:?}"))?;
+            refresh_panels(s, bus).await;
         }
         // handled in run() (need &mut session / task handles):
         Command::Connect { .. }

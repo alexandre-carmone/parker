@@ -84,6 +84,124 @@ pub enum Command {
     SetGuideParams(GuideParams),
     /// Turn per-frame target detection on/off for the on-screen overlay (independent of guiding).
     SetDetectionOverlay(bool),
+
+    // ---- generic INDI control panel ----
+    /// Set switch element(s) `elems` of switch property `prop` on device `device` to the given
+    /// on/off states. For `OneOfMany`/`AtMostOne` rules the driver clears siblings; for
+    /// `AnyOfMany` each element toggles independently.
+    SetIndiSwitch {
+        device: String,
+        prop: String,
+        elems: Vec<(String, bool)>,
+    },
+    /// Set number element(s) `elems` of number property `prop` on device `device`.
+    SetIndiNumber {
+        device: String,
+        prop: String,
+        elems: Vec<(String, f64)>,
+    },
+    /// Set text element(s) `elems` of text property `prop` on device `device`.
+    SetIndiText {
+        device: String,
+        prop: String,
+        elems: Vec<(String, String)>,
+    },
+}
+
+/// A device's full INDI property tree, mirrored from the driver into plain (crate-decoupled)
+/// types for the generic control panel. Rebuilt wholesale by the worker on each refresh and
+/// handed to the GUI behind an `Arc` (see [`Shared::camera_panel`]).
+#[derive(Clone, Debug, Default)]
+pub struct IndiPanel {
+    pub device: String,
+    pub groups: Vec<IndiGroup>,
+}
+
+/// One INDI property group (rendered as a collapsing section).
+#[derive(Clone, Debug, Default)]
+pub struct IndiGroup {
+    pub name: String,
+    pub props: Vec<IndiProp>,
+}
+
+/// One INDI property (a vector of typed elements) plus its display metadata.
+#[derive(Clone, Debug)]
+pub struct IndiProp {
+    /// INDI property name (used when sending a change).
+    pub name: String,
+    /// Human-friendly label (falls back to the name).
+    pub label: String,
+    /// Property state, for the status LED.
+    pub state: IndiState,
+    /// Whether the property is writable (`RW`/`WO`).
+    pub writable: bool,
+    /// The typed value(s).
+    pub value: IndiValue,
+}
+
+/// INDI property state (`PropertyState`), for the status LED.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum IndiState {
+    #[default]
+    Idle,
+    Ok,
+    Busy,
+    Alert,
+}
+
+/// The typed elements of an INDI property, mirrored by kind.
+#[derive(Clone, Debug)]
+pub enum IndiValue {
+    Number(Vec<IndiNumber>),
+    Switch {
+        rule: IndiSwitchRule,
+        items: Vec<IndiSwitch>,
+    },
+    Text(Vec<IndiText>),
+    Light(Vec<IndiLight>),
+    /// BLOB properties: element labels only (read-only, not editable here).
+    Blob(Vec<String>),
+}
+
+#[derive(Clone, Debug)]
+pub struct IndiNumber {
+    pub name: String,
+    pub label: String,
+    pub value: f64,
+    pub min: f64,
+    pub max: f64,
+    pub step: f64,
+    /// INDI printf/sexagesimal format string.
+    pub format: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct IndiSwitch {
+    pub name: String,
+    pub label: String,
+    pub on: bool,
+}
+
+/// INDI switch rule (`SwitchRule`), driving radio vs. checkbox rendering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndiSwitchRule {
+    OneOfMany,
+    AtMostOne,
+    AnyOfMany,
+}
+
+#[derive(Clone, Debug)]
+pub struct IndiText {
+    pub name: String,
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct IndiLight {
+    pub name: String,
+    pub label: String,
+    pub state: IndiState,
 }
 
 /// One of the camera's stream-format switch properties (e.g. `CCD_STREAM_ENCODER`,
@@ -195,6 +313,12 @@ pub struct Shared {
     /// Live recording progress.
     pub recording: RecordStatus,
 
+    // ---- generic INDI control panel ----
+    /// Full property tree of the bound camera / mount, mirrored for the generic control panel.
+    /// `None` until bound; refreshed on connect/select, after writes, and on a ~1 Hz tick.
+    pub camera_panel: Option<Arc<IndiPanel>>,
+    pub mount_panel: Option<Arc<IndiPanel>>,
+
     // ---- guiding (M2) telemetry, in frame pixels ----
     /// Whether the guide loop is currently running.
     pub guiding: bool,
@@ -253,6 +377,8 @@ impl Default for Shared {
             roi: (0, 0, 0, 0),
             stream_switches: Vec::new(),
             recording: RecordStatus::default(),
+            camera_panel: None,
+            mount_panel: None,
             guiding: false,
             calibrating: false,
             calibrated: false,

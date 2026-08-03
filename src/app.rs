@@ -1,13 +1,15 @@
 //! egui front-end: live view, camera controls, mount controls, and status/log.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use eframe::egui;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::bus::{
-    Bus, CameraSwitch, Command, ConnState, Dir, RecordConfig, RecordPhase, RecordStatus, RecordStop,
+    Bus, CameraSwitch, Command, ConnState, Dir, IndiPanel, IndiState, IndiSwitchRule, IndiValue,
+    RecordConfig, RecordPhase, RecordStatus, RecordStop,
 };
 use crate::guiding::{Calibration, DecMode, GuideMode, GuideParams, DEFAULT_CALIB_MS};
 
@@ -75,6 +77,13 @@ pub struct App {
     record_count: usize,
     record_delay_secs: f64,
 
+    // ---- generic INDI control panel edit buffers ----
+    /// Pending numeric edits, keyed `"{device}/{prop}/{elem}"`, lazily seeded from the driver
+    /// value and pushed only when the user clicks the property's Set button.
+    indi_num_edits: HashMap<String, f64>,
+    /// Pending text edits, keyed `"{device}/{prop}/{elem}"`.
+    indi_txt_edits: HashMap<String, String>,
+
     // ---- test/automation hooks (driven by env vars) ----
     autoconnect: bool,
     autostream: bool,
@@ -123,6 +132,8 @@ impl App {
             record_target_secs: 30.0,
             record_count: 1,
             record_delay_secs: 0.0,
+            indi_num_edits: HashMap::new(),
+            indi_txt_edits: HashMap::new(),
             // A screenshot run implies autoconnect + autostream so there is content to show.
             autoconnect: autoconnect || screenshot_path.is_some(),
             autostream: autoconnect || screenshot_path.is_some(),
@@ -210,6 +221,9 @@ struct Snap {
     guide_peak: f32,
     guide_history: VecDeque<(f32, f32)>,
     log_tail: Vec<String>,
+    // generic INDI control panel
+    camera_panel: Option<Arc<IndiPanel>>,
+    mount_panel: Option<Arc<IndiPanel>>,
 }
 
 impl App {
@@ -247,7 +261,30 @@ impl App {
             guide_peak: sh.guide_peak,
             guide_history: sh.guide_history.clone(),
             log_tail: sh.log.iter().rev().take(8).rev().cloned().collect(),
+            camera_panel: sh.camera_panel.clone(),
+            mount_panel: sh.mount_panel.clone(),
         }
+    }
+}
+
+/// Color + hover text for an INDI property/light state LED.
+fn led_color(state: IndiState) -> (egui::Color32, &'static str) {
+    match state {
+        IndiState::Idle => (egui::Color32::GRAY, "idle"),
+        IndiState::Ok => (egui::Color32::from_rgb(0x3c, 0xb3, 0x71), "ok"),
+        IndiState::Busy => (egui::Color32::from_rgb(0xd4, 0xa0, 0x17), "busy"),
+        IndiState::Alert => (egui::Color32::from_rgb(0xc0, 0x39, 0x2b), "alert"),
+    }
+}
+
+/// Format an INDI number value for read-only display: trims trailing zeros, keeps integers clean.
+fn format_num(v: f64) -> String {
+    if v == v.trunc() && v.abs() < 1e15 {
+        format!("{v:.0}")
+    } else {
+        let s = format!("{v:.6}");
+        let s = s.trim_end_matches('0').trim_end_matches('.');
+        s.to_string()
     }
 }
 
@@ -472,6 +509,12 @@ impl eframe::App for App {
             {
                 self.bus.set_preview_fps(self.preview_fps);
             }
+
+            ui.separator();
+            let camera_panel = snap.camera_panel.clone();
+            ui.collapsing("INDI Control Panel", |ui| {
+                self.indi_panel_ui(ui, camera_panel.as_deref());
+            });
         });
 
         // ---- Right: mount ----
@@ -537,6 +580,12 @@ impl eframe::App for App {
 
                 ui.separator();
                 self.guiding_controls(ui, &snap);
+
+                ui.separator();
+                let mount_panel = snap.mount_panel.clone();
+                ui.collapsing("INDI Control Panel", |ui| {
+                    self.indi_panel_ui(ui, mount_panel.as_deref());
+                });
             });
         });
 
@@ -819,6 +868,175 @@ impl App {
             ui.colored_label(color, format!("stream depth: {depth}-bit"));
         }
         ui.separator();
+    }
+
+    /// Generic INDI control panel: render a device's full property tree, grouped by INDI group.
+    /// Each group is a collapsing section; each property a row with a state LED, label, and a
+    /// type-specific editor (numbers/switches/text editable if writable; lights read-only).
+    fn indi_panel_ui(&mut self, ui: &mut egui::Ui, panel: Option<&IndiPanel>) {
+        let Some(panel) = panel else {
+            ui.label("(not connected)");
+            return;
+        };
+        if panel.groups.is_empty() {
+            ui.label("(no properties)");
+            return;
+        }
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, true])
+            .max_height(420.0)
+            .show(ui, |ui| {
+                for group in &panel.groups {
+                    egui::CollapsingHeader::new(&group.name)
+                        .id_salt(("indi", &panel.device, &group.name))
+                        .show(ui, |ui| {
+                            for prop in &group.props {
+                                self.indi_prop_row(ui, &panel.device, prop);
+                            }
+                        });
+                }
+            });
+    }
+
+    /// One INDI property row: state LED + label, then the typed editor(s) indented beneath.
+    fn indi_prop_row(&mut self, ui: &mut egui::Ui, device: &str, prop: &crate::bus::IndiProp) {
+        ui.horizontal(|ui| {
+            let (color, tip) = led_color(prop.state);
+            ui.colored_label(color, "⏺").on_hover_text(tip);
+            ui.strong(&prop.label);
+            if !prop.writable {
+                ui.weak("(ro)");
+            }
+        });
+        ui.indent(("indi_prop", device, &prop.name), |ui| match &prop.value {
+            IndiValue::Number(items) => {
+                egui::Grid::new(("indi_num", device, &prop.name))
+                    .num_columns(3)
+                    .show(ui, |ui| {
+                        for n in items {
+                            ui.label(&n.label);
+                            ui.monospace(format_num(n.value));
+                            if prop.writable {
+                                let key = format!("{device}/{}/{}", prop.name, n.name);
+                                let buf = self.indi_num_edits.entry(key).or_insert(n.value);
+                                let mut dv = egui::DragValue::new(buf);
+                                if n.min < n.max {
+                                    dv = dv.range(n.min..=n.max);
+                                }
+                                if n.step > 0.0 {
+                                    dv = dv.speed(n.step);
+                                }
+                                ui.add(dv);
+                            }
+                            ui.end_row();
+                        }
+                    });
+                if prop.writable && ui.button("Set").clicked() {
+                    let elems = items
+                        .iter()
+                        .map(|n| {
+                            let key = format!("{device}/{}/{}", prop.name, n.name);
+                            let v = self.indi_num_edits.get(&key).copied().unwrap_or(n.value);
+                            (n.name.clone(), v)
+                        })
+                        .collect();
+                    self.send(Command::SetIndiNumber {
+                        device: device.to_string(),
+                        prop: prop.name.clone(),
+                        elems,
+                    });
+                }
+            }
+            IndiValue::Switch { rule, items } => match rule {
+                IndiSwitchRule::AnyOfMany => {
+                    for sw in items {
+                        let mut on = sw.on;
+                        if ui
+                            .add_enabled(prop.writable, egui::Checkbox::new(&mut on, &sw.label))
+                            .clicked()
+                            && prop.writable
+                        {
+                            self.send(Command::SetIndiSwitch {
+                                device: device.to_string(),
+                                prop: prop.name.clone(),
+                                elems: vec![(sw.name.clone(), on)],
+                            });
+                        }
+                    }
+                }
+                // OneOfMany / AtMostOne: radio-style — pick one, the driver clears siblings.
+                _ => {
+                    for sw in items {
+                        if ui
+                            .add_enabled(
+                                prop.writable,
+                                egui::Button::selectable(sw.on, &sw.label),
+                            )
+                            .clicked()
+                            && prop.writable
+                            && !sw.on
+                        {
+                            self.send(Command::SetIndiSwitch {
+                                device: device.to_string(),
+                                prop: prop.name.clone(),
+                                elems: vec![(sw.name.clone(), true)],
+                            });
+                        }
+                    }
+                }
+            },
+            IndiValue::Text(items) => {
+                egui::Grid::new(("indi_txt", device, &prop.name))
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        for t in items {
+                            ui.label(&t.label);
+                            if prop.writable {
+                                let key = format!("{device}/{}/{}", prop.name, t.name);
+                                let buf = self
+                                    .indi_txt_edits
+                                    .entry(key)
+                                    .or_insert_with(|| t.value.clone());
+                                ui.text_edit_singleline(buf);
+                            } else {
+                                ui.monospace(&t.value);
+                            }
+                            ui.end_row();
+                        }
+                    });
+                if prop.writable && ui.button("Set").clicked() {
+                    let elems = items
+                        .iter()
+                        .map(|t| {
+                            let key = format!("{device}/{}/{}", prop.name, t.name);
+                            let v = self
+                                .indi_txt_edits
+                                .get(&key)
+                                .cloned()
+                                .unwrap_or_else(|| t.value.clone());
+                            (t.name.clone(), v)
+                        })
+                        .collect();
+                    self.send(Command::SetIndiText {
+                        device: device.to_string(),
+                        prop: prop.name.clone(),
+                        elems,
+                    });
+                }
+            }
+            IndiValue::Light(items) => {
+                for l in items {
+                    ui.horizontal(|ui| {
+                        let (color, tip) = led_color(l.state);
+                        ui.colored_label(color, "⏺").on_hover_text(tip);
+                        ui.label(&l.label);
+                    });
+                }
+            }
+            IndiValue::Blob(labels) => {
+                ui.weak(format!("blob: {}", labels.join(", ")));
+            }
+        });
     }
 
     /// Recording / sequence controls: record the live stream to SER — a single video or a timed
