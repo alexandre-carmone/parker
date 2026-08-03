@@ -47,11 +47,11 @@ struct RecordTask {
 /// loop and the overlay without doing centroid/NCC work on every high-FPS frame.
 const DETECT_INTERVAL: Duration = Duration::from_millis(100);
 
-/// While recording, throttle the live display to this interval. The stretch + Color32 conversion
-/// and GUI upload are the costly per-frame work; skipping most of them during a recording keeps
-/// CPU for writing the SER file while still showing a ~few-Hz preview. Frames are still decoded
-/// and written every time — only the on-screen refresh is rate-limited.
-const DISPLAY_INTERVAL_RECORDING: Duration = Duration::from_millis(200);
+/// Throttle the live preview to this interval (1 fps) to keep CPU load low. The stretch + Color32
+/// conversion and GUI upload are the costly per-frame work; capping the on-screen refresh rate
+/// skips most of it. Frames are still decoded, detected, and written every time — only the
+/// preview refresh is rate-limited.
+const DISPLAY_INTERVAL: Duration = Duration::from_millis(1000);
 
 /// Entry point for the worker task. Runs until the command channel closes.
 pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Context) {
@@ -600,11 +600,10 @@ async fn spawn_frame_task(
 
                         // Do the display stretch + Color32 conversion here, off the GUI
                         // thread, and publish a ready-to-upload image. Keep the raw frame
-                        // for capture. While recording, rate-limit this to spare CPU for the
-                        // SER writer — the preview refreshes at a few Hz instead of full FPS.
-                        let display_due = !bus.recording_active()
-                            || last_display
-                                .is_none_or(|t| now.duration_since(t) >= DISPLAY_INTERVAL_RECORDING);
+                        // for capture. Rate-limit the preview to DISPLAY_INTERVAL (1 fps) to
+                        // spare CPU — frames are still decoded and written at full FPS.
+                        let display_due = last_display
+                            .is_none_or(|t| now.duration_since(t) >= DISPLAY_INTERVAL);
                         if display_due {
                             last_display = Some(now);
                             let (auto, gain) = bus.display_settings();
