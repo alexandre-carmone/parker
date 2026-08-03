@@ -360,6 +360,23 @@ impl Camera {
         }
     }
 
+    /// Read the driver's own streaming frame-rate estimate from the standard INDI `FPS` property
+    /// (published by indibase's stream manager). Prefers `AVG_FPS` — the driver's 1-second rolling
+    /// average, which is steady — and falls back to the instantaneous `EST_FPS`. `None` if the
+    /// driver doesn't publish `FPS` (not all do) or it isn't a number vector.
+    pub async fn stream_fps(&self) -> Option<f64> {
+        let param = self.dev.get_parameter("FPS").await.ok()?;
+        let guard = param.read().await;
+        if let Parameter::NumberVector(nv) = &*guard {
+            nv.values
+                .get("AVG_FPS")
+                .or_else(|| nv.values.get("EST_FPS"))
+                .map(|n| f64::from(n.value))
+        } else {
+            None
+        }
+    }
+
     /// Read the full sensor size (`CCD_INFO` → `CCD_MAX_X`/`CCD_MAX_Y`) in pixels. Used to bound
     /// the ROI controls and to reset the subframe to full.
     pub async fn sensor_size(&self) -> Result<(u32, u32)> {

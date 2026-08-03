@@ -452,9 +452,25 @@ async fn refresh_panels(s: &Session, bus: &Bus) {
         Some(m) => Some(Arc::new(snapshot_panel(&m.dev).await)),
         None => None,
     };
+    // Frame rate comes straight from the driver's `FPS` property rather than being timed on the
+    // decode thread — the driver measures the true capture rate (before any client-side preview
+    // rate-limiting or dropped stale frames). Read it here at the 1 Hz panel-refresh cadence.
+    let driver_fps = match s.camera.as_ref() {
+        Some(cam) => cam.stream_fps().await,
+        None => None,
+    };
     if let Ok(mut sh) = bus.shared.lock() {
         sh.camera_panel = camera;
         sh.mount_panel = mount;
+        // Only trust the driver's rate while streaming; a stopped stream leaves `FPS` at its last
+        // value, so surface 0 (the stop/disconnect paths also clear it).
+        if sh.streaming {
+            if let Some(fps) = driver_fps {
+                sh.fps = fps as f32;
+            }
+        } else {
+            sh.fps = 0.0;
+        }
     }
 }
 
@@ -752,7 +768,6 @@ async fn spawn_frame_task(
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let mut seq: u64 = 0;
-            let mut last: Option<Instant> = None;
             // Guiding detector state persists across frames (holds the Surface reference patch).
             let mut detector = GuideDetector::default();
             let mut last_detect: Option<Instant> = None;
@@ -762,26 +777,11 @@ async fn spawn_frame_task(
                     Ok((frame, raw_pixels)) => {
                         seq += 1;
                         let now = Instant::now();
+                        // Frame rate is reported by the driver's `FPS` property (mirrored in
+                        // `refresh_panels`), not timed here.
                         if let Ok(mut sh) = bus.shared.lock() {
                             sh.frame_count = seq;
-                            if let Some(prev) = last {
-                                let dt = now.duration_since(prev).as_secs_f32();
-                                if dt > 0.0 && dt < 1.0 {
-                                    let inst = 1.0 / dt;
-                                    sh.fps = if sh.fps > 0.0 {
-                                        0.9 * sh.fps + 0.1 * inst
-                                    } else {
-                                        inst
-                                    };
-                                } else if dt >= 1.0 {
-                                    // A gap this large means the stream stalled or was just
-                                    // (re)started — drop the stale rate instead of dragging the
-                                    // EMA down with one huge interval.
-                                    sh.fps = 0.0;
-                                }
-                            }
                         }
-                        last = Some(now);
 
                         // Guiding detection (throttled): measure the target position and publish
                         // it for the guide loop + overlay. Runs only when enabled, and at most
