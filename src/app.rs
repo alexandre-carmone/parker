@@ -37,6 +37,8 @@ pub struct App {
     /// Live-view display stretch (raw stream frames are very dark).
     auto_stretch: bool,
     display_gain: f32,
+    /// Max preview refresh rate (fps); caps the stretch + upload to spare CPU.
+    preview_fps: f32,
     /// Force a texture re-upload when stretch settings change (even without a new frame).
     stretch_dirty: bool,
 
@@ -89,6 +91,7 @@ impl App {
         let screenshot_path = std::env::var("SOLAR_SCREENSHOT").ok();
         // Seed the worker's stretch settings from our defaults below.
         bus.set_display_settings(true, 1.0);
+        bus.set_preview_fps(1.0);
         App {
             bus,
             tx,
@@ -102,6 +105,7 @@ impl App {
             exposure_input: 0.05,
             auto_stretch: true,
             display_gain: 1.0,
+            preview_fps: 1.0,
             stretch_dirty: false,
             roi_x: 0,
             roi_y: 0,
@@ -453,6 +457,20 @@ impl eframe::App for App {
                 // frame is re-rendered on the next repaint.
                 self.bus.set_display_settings(self.auto_stretch, self.display_gain);
                 self.stretch_dirty = true;
+            }
+            if ui
+                .add(
+                    egui::Slider::new(&mut self.preview_fps, 0.5..=30.0)
+                        .text("preview fps")
+                        .logarithmic(true),
+                )
+                .on_hover_text(
+                    "Max preview refresh rate. Lower = less CPU. Recording and guiding are \
+                     unaffected — every frame is still decoded and written.",
+                )
+                .changed()
+            {
+                self.bus.set_preview_fps(self.preview_fps);
             }
         });
 

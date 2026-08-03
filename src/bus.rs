@@ -298,6 +298,9 @@ pub struct Bus {
     /// holds an `f32` via its bit pattern.
     pub auto_stretch: Arc<AtomicBool>,
     pub display_gain: Arc<AtomicU32>,
+    /// Max preview refresh rate (fps), read lock-free by the decode thread to rate-limit the
+    /// stretch + upload. Holds an `f32` via its bit pattern. `<= 0` means "every frame".
+    pub preview_fps: Arc<AtomicU32>,
 
     // ---- guiding (M2), read lock-free by the decode thread / guide loop ----
     /// Newest target measurement from the detector (latest-wins, like `latest_frame`).
@@ -337,6 +340,7 @@ impl Bus {
             display_seq: Arc::new(AtomicU64::new(0)),
             auto_stretch: Arc::new(AtomicBool::new(true)),
             display_gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            preview_fps: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             guide_sample: Arc::new(ArcSwapOption::empty()),
             detect_enabled: Arc::new(AtomicBool::new(false)),
             guide_mode: Arc::new(AtomicU8::new(GuideMode::Disk.as_u8())),
@@ -370,6 +374,16 @@ impl Bus {
             self.auto_stretch.load(Ordering::Relaxed),
             f32::from_bits(self.display_gain.load(Ordering::Relaxed)),
         )
+    }
+
+    /// GUI -> worker: set the max preview refresh rate in fps (`<= 0` = every frame).
+    pub fn set_preview_fps(&self, fps: f32) {
+        self.preview_fps.store(fps.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Worker: max preview refresh rate in fps (`<= 0` = every frame).
+    pub fn preview_fps(&self) -> f32 {
+        f32::from_bits(self.preview_fps.load(Ordering::Relaxed))
     }
 
     /// Worker: publish a freshly rendered display image and signal the GUI to upload it.

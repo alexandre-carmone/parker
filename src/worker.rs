@@ -47,11 +47,10 @@ struct RecordTask {
 /// loop and the overlay without doing centroid/NCC work on every high-FPS frame.
 const DETECT_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Throttle the live preview to this interval (1 fps) to keep CPU load low. The stretch + Color32
-/// conversion and GUI upload are the costly per-frame work; capping the on-screen refresh rate
-/// skips most of it. Frames are still decoded, detected, and written every time — only the
-/// preview refresh is rate-limited.
-const DISPLAY_INTERVAL: Duration = Duration::from_millis(1000);
+// The live preview is rate-limited to `Bus::preview_fps` (default 1 fps, configurable in the UI)
+// to keep CPU load low. The stretch + Color32 conversion and GUI upload are the costly per-frame
+// work; capping the on-screen refresh rate skips most of it. Frames are still decoded, detected,
+// and written every time — only the preview refresh is rate-limited.
 
 /// Entry point for the worker task. Runs until the command channel closes.
 pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Context) {
@@ -600,10 +599,13 @@ async fn spawn_frame_task(
 
                         // Do the display stretch + Color32 conversion here, off the GUI
                         // thread, and publish a ready-to-upload image. Keep the raw frame
-                        // for capture. Rate-limit the preview to DISPLAY_INTERVAL (1 fps) to
+                        // for capture. Rate-limit the preview to the configured preview_fps to
                         // spare CPU — frames are still decoded and written at full FPS.
-                        let display_due = last_display
-                            .is_none_or(|t| now.duration_since(t) >= DISPLAY_INTERVAL);
+                        let preview_fps = bus.preview_fps();
+                        let display_due = preview_fps <= 0.0
+                            || last_display.is_none_or(|t| {
+                                now.duration_since(t).as_secs_f32() >= 1.0 / preview_fps
+                            });
                         if display_due {
                             last_display = Some(now);
                             let (auto, gain) = bus.display_settings();
