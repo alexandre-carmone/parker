@@ -43,6 +43,13 @@ pub struct App {
     preview_fps: f32,
     /// Force a texture re-upload when stretch settings change (even without a new frame).
     stretch_dirty: bool,
+    /// Cached luminance histogram (256 bins) of the latest frame, the frame seq it was computed
+    /// from, and that frame's full-scale ADU (255 for 8-bit, 65535 for 16-bit) for the x-axis.
+    /// Recomputed lazily only while the Histogram section is expanded (see `histogram_ui`), so a
+    /// collapsed panel costs nothing.
+    hist_bins: [u32; 256],
+    hist_seq: u64,
+    hist_max_adu: u32,
 
     /// Pending ROI numeric inputs (sensor pixels): x, y, width, height. Seeded to the full
     /// sensor once its size is known, and overwritten when the user drags a rectangle.
@@ -115,6 +122,9 @@ impl App {
             auto_stretch: true,
             display_gain: 1.0,
             preview_fps: 1.0,
+            hist_bins: [0; 256],
+            hist_seq: 0,
+            hist_max_adu: 255,
             stretch_dirty: false,
             roi_x: 0,
             roi_y: 0,
@@ -509,6 +519,10 @@ impl eframe::App for App {
             {
                 self.bus.set_preview_fps(self.preview_fps);
             }
+
+            ui.collapsing("Histogram", |ui| {
+                self.histogram_ui(ui);
+            });
 
             ui.separator();
             let camera_panel = snap.camera_panel.clone();
@@ -1343,6 +1357,59 @@ impl App {
     }
 
     /// The guide-error graph (RA/DEC over time) plus live error / split-RMS readout.
+    /// Collapsible luminance histogram of the live preview. This runs on the GUI thread, but only
+    /// while the section is expanded (the `collapsing` closure isn't called when closed), and the
+    /// 256-bin scan is recomputed only when a new frame arrives — so an open panel adds at most one
+    /// pass per displayed frame, and a closed one costs nothing.
+    fn histogram_ui(&mut self, ui: &mut egui::Ui) {
+        use egui_plot::{Bar, BarChart, Plot};
+
+        if let Some(frame) = self.bus.latest_frame.load_full() {
+            if frame.seq != self.hist_seq {
+                self.hist_seq = frame.seq;
+                self.hist_bins = frame.luma_histogram();
+                self.hist_max_adu = frame.max_adu;
+            }
+        }
+        if self.hist_seq == 0 {
+            ui.weak("No frames yet.");
+            return;
+        }
+
+        // The 256 bins map onto the source's ADU range: each bin spans `(max_adu + 1) / 256` ADU,
+        // so for an 8-bit stream a bin is 1 ADU wide (x: 0..255) and for a 16-bit stream it is
+        // 256 ADU wide (x: 0..65535, at top-8-bit resolution — the preview only carries the high
+        // byte). Placing each bar at its bin's ADU centre labels the x-axis in true ADU.
+        let step = (self.hist_max_adu as f64 + 1.0) / 256.0;
+        ui.weak(format!("ADU 0–{} ({}-bit)", self.hist_max_adu, if self.hist_max_adu > 255 { 16 } else { 8 }));
+
+        // Normalize to the tallest bin so the shape is readable regardless of frame size. A
+        // log-ish feel isn't needed here; a linear bar chart matches how imagers read exposure.
+        let peak = self.hist_bins.iter().copied().max().unwrap_or(1).max(1) as f64;
+        let bars: Vec<Bar> = self
+            .hist_bins
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| Bar::new(i as f64 * step + step / 2.0, c as f64 / peak).width(step))
+            .collect();
+        let chart = BarChart::new("ADU", bars).color(egui::Color32::from_gray(180));
+        Plot::new("hist_plot")
+            .height(90.0)
+            .show_axes([true, false])
+            .show_y(false)
+            .allow_zoom(false)
+            .allow_drag(false)
+            .allow_scroll(false)
+            .allow_boxed_zoom(false)
+            .include_x(0.0)
+            .include_x(self.hist_max_adu as f64)
+            .include_y(0.0)
+            .include_y(1.05)
+            .show(ui, |plot_ui| {
+                plot_ui.bar_chart(chart);
+            });
+    }
+
     fn guide_graph(&self, ui: &mut egui::Ui, snap: &Snap) {
         use egui_plot::{HLine, Legend, Line, Plot, PlotPoints};
         // Optional arcsec conversion for the numeric readouts.

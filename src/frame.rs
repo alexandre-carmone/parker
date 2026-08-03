@@ -16,6 +16,10 @@ pub struct Frame {
     pub rgba: Vec<u8>,
     /// Monotonic frame sequence number.
     pub seq: u64,
+    /// Full-scale ADU of the source samples: 255 for an 8-bit stream (and MJPEG), 65535 for a
+    /// 16-bit stream. The preview `rgba` is always 8-bit — for 16-bit it holds the high byte — so
+    /// this records the *original* dynamic range, letting the histogram label its x-axis in ADU.
+    pub max_adu: u32,
     /// When the frame was decoded (for FPS + capture timestamps).
     #[allow(dead_code)]
     pub decoded_at: Instant,
@@ -28,6 +32,7 @@ impl Frame {
             height,
             rgba,
             seq,
+            max_adu: 255,
             decoded_at: Instant::now(),
         }
     }
@@ -66,11 +71,12 @@ impl Frame {
             return Err(anyhow!("raw stream: unknown frame geometry"));
         }
         let mut rgba = Vec::with_capacity(px * 4);
+        let is_16bit = data.len() == px * 2;
         if data.len() == px {
             for &g in data {
                 rgba.extend_from_slice(&[g, g, g, 255]);
             }
-        } else if data.len() == px * 2 {
+        } else if is_16bit {
             for s in data.chunks_exact(2) {
                 let g = u16::from_le_bytes([s[0], s[1]]);
                 let hi = (g >> 8) as u8;
@@ -84,7 +90,24 @@ impl Frame {
                 height
             ));
         }
-        Ok(Frame::new(width, height, rgba, seq))
+        let mut frame = Frame::new(width, height, rgba, seq);
+        if is_16bit {
+            frame.max_adu = 65535;
+        }
+        Ok(frame)
+    }
+
+    /// Luminance histogram of the raw frame: 256 bins over the pixels' Rec. 601 luma. Used by the
+    /// preview histogram to judge exposure — computed off the un-stretched `rgba` so it reflects the
+    /// true sensor levels, not the display gain. A single pass over the pixels.
+    pub fn luma_histogram(&self) -> [u32; 256] {
+        let mut bins = [0u32; 256];
+        for p in self.rgba.chunks_exact(4) {
+            // Integer Rec. 601 luma (77·R + 150·G + 29·B) / 256.
+            let luma = (77 * p[0] as u32 + 150 * p[1] as u32 + 29 * p[2] as u32) >> 8;
+            bins[luma.min(255) as usize] += 1;
+        }
+        bins
     }
 
     /// Apply the live-view display stretch and produce an egui image ready for texture upload.
