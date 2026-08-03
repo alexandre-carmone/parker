@@ -24,7 +24,7 @@ use crate::guiding::{self, GuideDetector, GuideSample};
 use crate::indi::camera::Camera;
 use crate::indi::mount::Mount;
 use crate::indi::Session;
-use crate::recorder::inflate_zlib;
+use crate::frame::inflate_zlib;
 
 /// The running guide control loop: its task plus a stop flag it polls each cycle. Dropping the
 /// handle alone would leave the task running, so callers must call [`GuideLoop::shutdown`].
@@ -774,7 +774,7 @@ async fn spawn_frame_task(
             let mut last_display: Option<Instant> = None;
             while let Some(raw) = slot.wait() {
                 match decode_frame(&bus, &raw, seq + 1) {
-                    Ok((frame, raw_pixels)) => {
+                    Ok(frame) => {
                         seq += 1;
                         let now = Instant::now();
                         // Frame rate is reported by the driver's `FPS` property (mirrored in
@@ -800,27 +800,10 @@ async fn spawn_frame_task(
                             }
                         }
 
-                        // Recording: append this frame to the open SER file — native raw bytes
-                        // for a RAW stream, or RGB extracted from the MJPEG-decoded frame. A
-                        // no-op (no lock taken) unless a recording is armed.
-                        if bus.recording_active() {
-                            match &raw_pixels {
-                                Some(bytes) => bus.write_record_frame(bytes),
-                                None => {
-                                    let rgb: Vec<u8> = frame
-                                        .rgba
-                                        .chunks_exact(4)
-                                        .flat_map(|p| [p[0], p[1], p[2]])
-                                        .collect();
-                                    bus.write_record_frame(&rgb);
-                                }
-                            }
-                        }
-
                         // Do the display stretch + Color32 conversion here, off the GUI
                         // thread, and publish a ready-to-upload image. Keep the raw frame
                         // for capture. Rate-limit the preview to the configured preview_fps to
-                        // spare CPU — frames are still decoded and written at full FPS.
+                        // spare CPU — frames are still decoded and detected at full FPS.
                         let preview_fps = bus.preview_fps();
                         let display_due = preview_fps <= 0.0
                             || last_display.is_none_or(|t| {
@@ -877,14 +860,11 @@ async fn spawn_frame_task(
     })
 }
 
-/// Decode one raw video BLOB into a display [`Frame`], and return the native payload to record
-/// when a recording is armed. MJPEG (`.stream_jpg`) is decoded by `image`; RAW streams
-/// (`.stream` / zlib-compressed `.stream.z`) are interpreted using the current readout geometry.
-/// The returned `Option<Vec<u8>>` is the sensor-native bytes to write to SER for a raw stream
-/// (the MJPEG path returns `None` — the caller extracts RGB from the decoded frame instead), and
-/// is only materialized when [`Bus::recording_active`] is set, to keep the non-recording hot path
-/// allocation-free.
-fn decode_frame(bus: &Bus, raw: &RawFrame, seq: u64) -> Result<(Frame, Option<Vec<u8>>)> {
+/// Decode one raw video BLOB into a display [`Frame`]. MJPEG (`.stream_jpg`) is decoded by `image`;
+/// RAW streams (`.stream` / zlib-compressed `.stream.z`) are interpreted using the current readout
+/// geometry. Also records the raw payload's byte length in the [`Bus`] for the UI's bit-depth
+/// display. (Recording is driver-side now, so no frame payload is materialized here.)
+fn decode_frame(bus: &Bus, raw: &RawFrame, seq: u64) -> Result<Frame> {
     let fmt = raw.format.as_deref();
     // Trust the payload's own magic bytes over the driver's format label: some drivers
     // (e.g. Player One) keep delivering MJPEG frames while `CCD_STREAM_ENCODER` reports RAW, so
@@ -894,7 +874,7 @@ fn decode_frame(bus: &Bus, raw: &RawFrame, seq: u64) -> Result<(Frame, Option<Ve
         .map(|f| f.contains("jpg") || f.contains("jpeg"))
         .unwrap_or(false);
     if label_jpeg || looks_like_jpeg(&raw.data) {
-        return Ok((Frame::from_stream_blob(fmt, &raw.data, seq)?, None));
+        return Frame::from_stream_blob(fmt, &raw.data, seq);
     }
 
     let label_zlib = fmt.map(|f| f.ends_with(".z")).unwrap_or(false);
@@ -903,16 +883,11 @@ fn decode_frame(bus: &Bus, raw: &RawFrame, seq: u64) -> Result<(Frame, Option<Ve
         let pixels = inflate_zlib(&raw.data).map_err(|e| anyhow!("inflating raw stream: {e}"))?;
         bus.set_last_raw_len(pixels.len());
         let (w, h) = resolve_raw_geometry(bus, pixels.len());
-        let frame = Frame::from_raw_stream(&pixels, w, h, seq)?;
-        let rec = bus.recording_active().then_some(pixels);
-        Ok((frame, rec))
+        Frame::from_raw_stream(&pixels, w, h, seq)
     } else {
         bus.set_last_raw_len(raw.data.len());
         let (w, h) = resolve_raw_geometry(bus, raw.data.len());
-        let frame = Frame::from_raw_stream(&raw.data, w, h, seq)?;
-        // Clone the native bytes only when recording is actually running.
-        let rec = bus.recording_active().then(|| raw.data.as_ref().clone());
-        Ok((frame, rec))
+        Frame::from_raw_stream(&raw.data, w, h, seq)
     }
 }
 

@@ -143,6 +143,16 @@ impl Frame {
     }
 }
 
+/// Inflate a zlib-compressed `.stream.z` raw frame. The `indi` crate only base64-decodes BLOBs;
+/// compressed raw streams arrive still deflated, so we inflate them here before decoding.
+pub fn inflate_zlib(data: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut decoder = flate2::read::ZlibDecoder::new(data);
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out)?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

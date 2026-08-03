@@ -8,5 +8,4 @@ pub mod bus;
 pub mod frame;
 pub mod guiding;
 pub mod indi;
-pub mod recorder;
 pub mod worker;

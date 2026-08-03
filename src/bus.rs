@@ -9,8 +9,6 @@
 //! - worker -> GUI (state): [`Shared`] behind a std `Mutex`, read each repaint.
 
 use std::collections::VecDeque;
-use std::fs::File;
-use std::io::BufWriter;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -19,7 +17,6 @@ use egui::ColorImage;
 
 use crate::frame::Frame;
 use crate::guiding::{GuideMode, GuideParams, GuideSample};
-use crate::recorder::SerRecorder;
 
 /// Cardinal nudge directions for manual mount slewing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -439,11 +436,6 @@ pub struct Bus {
     pub ref_generation: Arc<AtomicU64>,
 
     // ---- recording (M3), read lock-free by the decode thread ----
-    /// Cheap gate: when false the decode thread never touches the recorder mutex.
-    pub recording_active: Arc<AtomicBool>,
-    /// The SER file currently being written (installed by the recording orchestrator). The decode
-    /// thread appends each frame; the orchestrator reads `frame_count` and finalizes.
-    pub recorder: Arc<Mutex<Option<SerRecorder<BufWriter<File>>>>>,
     /// Current readout geometry, so the decode thread can interpret dimensionless raw frames.
     pub frame_w: Arc<AtomicU32>,
     pub frame_h: Arc<AtomicU32>,
@@ -452,8 +444,8 @@ pub struct Bus {
     /// byte length doesn't match the requested ROI.
     pub sensor_w: Arc<AtomicU32>,
     pub sensor_h: Arc<AtomicU32>,
-    /// Byte length of the most recent raw (decompressed) frame — lets the orchestrator infer the
-    /// stream's bit depth (bytes-per-pixel) when sizing a new SER file.
+    /// Byte length of the most recent raw (decompressed) frame — lets the UI infer the stream's
+    /// bit depth (bytes-per-pixel) for display.
     pub last_raw_len: Arc<AtomicUsize>,
 }
 
@@ -471,8 +463,6 @@ impl Bus {
             detect_enabled: Arc::new(AtomicBool::new(false)),
             guide_mode: Arc::new(AtomicU8::new(GuideMode::Disk.as_u8())),
             ref_generation: Arc::new(AtomicU64::new(0)),
-            recording_active: Arc::new(AtomicBool::new(false)),
-            recorder: Arc::new(Mutex::new(None)),
             frame_w: Arc::new(AtomicU32::new(0)),
             frame_h: Arc::new(AtomicU32::new(0)),
             sensor_w: Arc::new(AtomicU32::new(0)),
@@ -584,32 +574,9 @@ impl Bus {
         self.last_raw_len.store(len, Ordering::Relaxed);
     }
 
-    /// Orchestrator: the newest raw frame's decompressed byte length (for bit-depth inference).
+    /// The newest raw frame's decompressed byte length (for bit-depth inference in the UI).
     pub fn last_raw_len(&self) -> usize {
         self.last_raw_len.load(Ordering::Relaxed)
-    }
-
-    /// Whether the decode thread should append frames to the recorder this frame.
-    pub fn recording_active(&self) -> bool {
-        self.recording_active.load(Ordering::Relaxed)
-    }
-
-    /// Decode thread: append one frame's native payload to the open SER file. A size mismatch
-    /// (e.g. geometry changed mid-recording) is counted as a dropped frame rather than corrupting
-    /// the file. Never holds the recorder and `shared` locks at the same time.
-    pub fn write_record_frame(&self, bytes: &[u8]) {
-        let mismatch = match self.recorder.lock() {
-            Ok(mut guard) => match guard.as_mut() {
-                Some(rec) => rec.write_frame(bytes).is_err(),
-                None => false,
-            },
-            Err(_) => false,
-        };
-        if mismatch {
-            if let Ok(mut sh) = self.shared.lock() {
-                sh.recording.dropped += 1;
-            }
-        }
     }
 }
 

@@ -72,21 +72,6 @@ impl Camera {
         }
     }
 
-    /// Read the sensor's Bayer pattern from `CCD_CFA` (`CFA_TYPE`, e.g. "RGGB"). Absent on mono
-    /// cameras — `None` then means mono, which is what the SER recorder assumes.
-    pub async fn cfa(&self) -> Option<String> {
-        let param = self.dev.get_parameter("CCD_CFA").await.ok()?;
-        let guard = param.read().await;
-        if let Parameter::TextVector(tv) = &*guard {
-            tv.values
-                .get("CFA_TYPE")
-                .map(|t| t.value.clone())
-                .filter(|s| !s.trim().is_empty())
-        } else {
-            None
-        }
-    }
-
     /// Set this connection's CCD1 BLOB transport policy (`Never`/`Also`/`Only`). BLOB enable is
     /// per-connection server state, which is what lets us isolate frame data on its own socket.
     pub async fn set_blob(&self, enabled: indi::BlobEnable) -> Result<()> {
