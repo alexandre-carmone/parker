@@ -9,15 +9,24 @@ the pure-Rust [`indi`](https://crates.io/crates/indi) crate — no libindi/C++ l
 ## Features
 
 - **Live view** with off-thread auto-stretch; a high-FPS stream drops stale frames rather than
-  queuing, so the display stays current.
+  queuing, so the display stays current. The preview is rate-limited to a configurable
+  **preview FPS** (default 1 fps) so a slow display never throttles capture or recording.
 - **Camera control** — exposure/gain/ROI, plus stream-format switches surfaced generically
   (including the 16-bit RAW path).
+- **Generic INDI panel** — raw driver properties for the camera and mount, grouped and editable
+  straight from the UI, so any driver-specific control is reachable unconfigured.
+- **Histogram** — collapsible luminance histogram of the live preview, computed off the
+  un-stretched frame and labelled in ADU, for judging exposure.
+- **Focus assist** — a per-frame Brenner-gradient sharpness metric, EMA-smoothed and peak-held
+  across frames so seeing jitter doesn't drown the reading while you rack focus.
 - **Mount control** — nudge/slew via pulse-guide and motion commands.
 - **Stream guiding** — target detection runs on the decode thread (disk centroid or surface
   cross-correlation); the async control loop issues pulse-guide corrections. Calibration must
   succeed before guiding.
-- **SER recording** — writes the native stream to SER files, orchestrated as sequences of
-  videos. Handles `.stream` (raw), `.stream.z` (zlib), and `.stream_jpg` (MJPEG) payloads.
+- **SER recording** — drives the driver's own `RECORD_STREAM` control, so the indiserver host
+  writes the SER file; solar orchestrates sequences of videos (count, per-video stop by frames
+  or duration, inter-video delay). The stream keeps running throughout, so guiding stays locked
+  across the whole sequence.
 
 Devices are discovered by the `DRIVER_INTERFACE` bitmask, not by hard-coded names, so
 simulators, PlayerOne cameras, and the LX200/OnStep mount all work unconfigured.
@@ -76,6 +85,8 @@ Two halves that communicate **only** through `bus::Bus`:
 `Bus` (`bus.rs`) is the single source of truth: `Command`s flow GUI → worker over an mpsc
 channel; frames flow worker → GUI via latest-wins `ArcSwapOption` (stale frames dropped);
 shared state sits behind a briefly-held mutex, with lock-free atomic flags for the hot paths.
+Recording is orchestrated by the worker but performed by the driver (`RECORD_STREAM`); focus
+sharpness (`focus.rs`) is measured on the decode thread and smoothed before it reaches the GUI.
 
 Video BLOBs run on a **second dedicated INDI connection** so high-rate frame data doesn't
 starve control commands on the main connection.
