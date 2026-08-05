@@ -5,6 +5,7 @@
 
 pub mod app;
 pub mod bus;
+pub mod focus;
 pub mod frame;
 pub mod guiding;
 pub mod indi;

@@ -19,7 +19,9 @@ use crate::bus::{
     IndiState, IndiSwitch, IndiSwitchRule, IndiText, IndiValue, RecordConfig, RecordPhase,
     RecordStop,
 };
+use crate::focus;
 use crate::frame::Frame;
+use crate::guiding::detector::to_gray;
 use crate::guiding::{self, GuideDetector, GuideSample};
 use crate::indi::camera::Camera;
 use crate::indi::mount::Mount;
@@ -50,6 +52,16 @@ struct RecordTask {
 /// How often the decode thread runs detection while enabled — enough to feed the few-Hz control
 /// loop and the overlay without doing centroid/NCC work on every high-FPS frame.
 const DETECT_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How often the decode thread publishes the smoothed focus metric to the GUI while measuring.
+/// The metric is computed on *every* frame (feeding the EMA); only the publish is throttled, to
+/// keep mutex pressure off the shared state.
+const FOCUS_PUB_INTERVAL: Duration = Duration::from_millis(100);
+/// EMA smoothing factor for the focus metric — lower = smoother (more seeing rejection), slower
+/// to respond. 0.2 averages over ~5 frames' worth of samples.
+const FOCUS_EMA_ALPHA: f64 = 0.2;
+/// Cap on the rolling focus-curve history the GUI plots.
+const FOCUS_HISTORY_CAP: usize = 300;
 
 // The live preview is rate-limited to `Bus::preview_fps` (default 1 fps, configurable in the UI)
 // to keep CPU load low. The stretch + Color32 conversion and GUI upload are the costly per-frame
@@ -772,6 +784,10 @@ async fn spawn_frame_task(
             let mut detector = GuideDetector::default();
             let mut last_detect: Option<Instant> = None;
             let mut last_display: Option<Instant> = None;
+            // Focus-measurement state, smoothed across frames off the shared lock.
+            let mut focus_ema: Option<f64> = None;
+            let mut focus_peak: f64 = 0.0;
+            let mut last_focus_pub: Option<Instant> = None;
             while let Some(raw) = slot.wait() {
                 match decode_frame(&bus, &raw, seq + 1) {
                     Ok(frame) => {
@@ -798,6 +814,49 @@ async fn spawn_frame_task(
                                     sh.detected = detected;
                                 }
                             }
+                        }
+
+                        // Focus measurement: compute a sharpness metric on every frame (cheap,
+                        // one pass) and smooth it with an EMA so seeing jitter doesn't swamp the
+                        // reading. Only the publish to `shared` is throttled. Runs only while the
+                        // Focus panel has it enabled, so it's free otherwise.
+                        if bus.focus_enabled() {
+                            if bus.take_focus_reset() {
+                                focus_ema = None;
+                                focus_peak = 0.0;
+                                if let Ok(mut sh) = bus.shared.lock() {
+                                    sh.focus_metric = 0.0;
+                                    sh.focus_peak = 0.0;
+                                    sh.focus_history.clear();
+                                }
+                            }
+                            let gray = to_gray(&frame.rgba, frame.width, frame.height);
+                            let raw = focus::sharpness(&gray, frame.width, frame.height);
+                            let ema = match focus_ema {
+                                Some(prev) => prev * (1.0 - FOCUS_EMA_ALPHA) + raw * FOCUS_EMA_ALPHA,
+                                None => raw,
+                            };
+                            focus_ema = Some(ema);
+                            focus_peak = focus_peak.max(ema);
+                            let due = last_focus_pub
+                                .is_none_or(|t| now.duration_since(t) >= FOCUS_PUB_INTERVAL);
+                            if due {
+                                last_focus_pub = Some(now);
+                                if let Ok(mut sh) = bus.shared.lock() {
+                                    sh.focus_metric = ema as f32;
+                                    sh.focus_peak = focus_peak as f32;
+                                    sh.focus_history.push_back(ema as f32);
+                                    while sh.focus_history.len() > FOCUS_HISTORY_CAP {
+                                        sh.focus_history.pop_front();
+                                    }
+                                }
+                                ctx.request_repaint();
+                            }
+                        } else {
+                            // Reset so a fresh enable starts clean (no stale peak/EMA).
+                            focus_ema = None;
+                            focus_peak = 0.0;
+                            last_focus_pub = None;
                         }
 
                         // Do the display stretch + Color32 conversion here, off the GUI

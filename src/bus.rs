@@ -348,6 +348,14 @@ pub struct Shared {
     /// UI toggle: run detection for the on-screen overlay even when not guiding.
     pub detect_overlay: bool,
 
+    // ---- focus measurement ----
+    /// Smoothed (EMA) sharpness metric of the current frame/ROI. 0 until measuring.
+    pub focus_metric: f32,
+    /// Best (highest) smoothed metric seen since the last reset — the peak-hold.
+    pub focus_peak: f32,
+    /// Rolling history of the smoothed metric for the focus curve, capped.
+    pub focus_history: VecDeque<f32>,
+
     /// Rolling log (most recent last), capped.
     pub log: VecDeque<String>,
 }
@@ -391,6 +399,9 @@ impl Default for Shared {
             guide_params: GuideParams::default(),
             guide_mode: GuideMode::Disk,
             detect_overlay: false,
+            focus_metric: 0.0,
+            focus_peak: 0.0,
+            focus_history: VecDeque::new(),
             log: VecDeque::new(),
         }
     }
@@ -447,6 +458,12 @@ pub struct Bus {
     /// Byte length of the most recent raw (decompressed) frame — lets the UI infer the stream's
     /// bit depth (bytes-per-pixel) for display.
     pub last_raw_len: Arc<AtomicUsize>,
+
+    // ---- focus measurement, read lock-free by the decode thread ----
+    /// When set, the decode thread measures per-frame sharpness (over the current ROI/frame).
+    pub focus_enabled: Arc<AtomicBool>,
+    /// Set by the GUI to ask the decode thread to clear its peak-hold / EMA / history.
+    pub focus_reset: Arc<AtomicBool>,
 }
 
 impl Bus {
@@ -468,6 +485,8 @@ impl Bus {
             sensor_w: Arc::new(AtomicU32::new(0)),
             sensor_h: Arc::new(AtomicU32::new(0)),
             last_raw_len: Arc::new(AtomicUsize::new(0)),
+            focus_enabled: Arc::new(AtomicBool::new(false)),
+            focus_reset: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -500,6 +519,26 @@ impl Bus {
     /// Worker: max preview refresh rate in fps (`<= 0` = every frame).
     pub fn preview_fps(&self) -> f32 {
         f32::from_bits(self.preview_fps.load(Ordering::Relaxed))
+    }
+
+    /// GUI -> worker: turn per-frame focus measurement on/off.
+    pub fn set_focus_enabled(&self, on: bool) {
+        self.focus_enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether the decode thread should measure focus this frame.
+    pub fn focus_enabled(&self) -> bool {
+        self.focus_enabled.load(Ordering::Relaxed)
+    }
+
+    /// GUI -> worker: request the focus peak-hold / history be reset.
+    pub fn request_focus_reset(&self) {
+        self.focus_reset.store(true, Ordering::Relaxed);
+    }
+
+    /// Decode thread: consume a pending focus-reset request (returns true once per request).
+    pub fn take_focus_reset(&self) -> bool {
+        self.focus_reset.swap(false, Ordering::Relaxed)
     }
 
     /// Worker: publish a freshly rendered display image and signal the GUI to upload it.

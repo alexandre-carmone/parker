@@ -51,6 +51,10 @@ pub struct App {
     hist_seq: u64,
     hist_max_adu: u32,
 
+    /// Focus-measurement UI state: whether the decode thread is measuring sharpness. Mirrors
+    /// [`Bus::focus_enabled`]; toggled from the Focus section.
+    focus_enabled: bool,
+
     /// Pending ROI numeric inputs (sensor pixels): x, y, width, height. Seeded to the full
     /// sensor once its size is known, and overwritten when the user drags a rectangle.
     roi_x: i64,
@@ -125,6 +129,7 @@ impl App {
             hist_bins: [0; 256],
             hist_seq: 0,
             hist_max_adu: 255,
+            focus_enabled: false,
             stretch_dirty: false,
             roi_x: 0,
             roi_y: 0,
@@ -230,6 +235,10 @@ struct Snap {
     guide_rms_dec: f32,
     guide_peak: f32,
     guide_history: VecDeque<(f32, f32)>,
+    // focus measurement
+    focus_metric: f32,
+    focus_peak: f32,
+    focus_history: VecDeque<f32>,
     log_tail: Vec<String>,
     // generic INDI control panel
     camera_panel: Option<Arc<IndiPanel>>,
@@ -270,6 +279,9 @@ impl App {
             guide_rms_dec: sh.guide_rms_dec,
             guide_peak: sh.guide_peak,
             guide_history: sh.guide_history.clone(),
+            focus_metric: sh.focus_metric,
+            focus_peak: sh.focus_peak,
+            focus_history: sh.focus_history.clone(),
             log_tail: sh.log.iter().rev().take(8).rev().cloned().collect(),
             camera_panel: sh.camera_panel.clone(),
             mount_panel: sh.mount_panel.clone(),
@@ -522,6 +534,10 @@ impl eframe::App for App {
 
             ui.collapsing("Histogram", |ui| {
                 self.histogram_ui(ui);
+            });
+
+            ui.collapsing("Focus", |ui| {
+                self.focus_ui(ui, &snap);
             });
 
             ui.separator();
@@ -1407,6 +1423,103 @@ impl App {
             .include_y(1.05)
             .show(ui, |plot_ui| {
                 plot_ui.bar_chart(chart);
+            });
+    }
+
+    /// Focus-measurement section: a smoothed sharpness readout, peak-hold, and a rolling curve to
+    /// chase best focus by hand. Sharpness is measured over the current frame — set a hardware ROI
+    /// over a sunspot/limb to focus on that region.
+    fn focus_ui(&mut self, ui: &mut egui::Ui, snap: &Snap) {
+        use egui_plot::{HLine, Line, Plot, PlotPoints};
+
+        ui.horizontal(|ui| {
+            if ui
+                .checkbox(&mut self.focus_enabled, "Measure focus")
+                .on_hover_text(
+                    "Compute a live sharpness metric over the current frame/ROI. Higher = sharper. \
+                     Turn your focuser to maximize it.",
+                )
+                .changed()
+            {
+                self.bus.set_focus_enabled(self.focus_enabled);
+            }
+            if ui
+                .add_enabled(self.focus_enabled, egui::Button::new("Reset peak"))
+                .clicked()
+            {
+                self.bus.request_focus_reset();
+            }
+        });
+
+        if !self.focus_enabled {
+            ui.weak("Enable to measure sharpness.");
+            return;
+        }
+
+        // Trend arrow: compare the mean of the recent half of the window to the earlier half, so a
+        // small seeing wobble doesn't flip it every frame.
+        let hist = &snap.focus_history;
+        let trend = {
+            let n = hist.len();
+            if n >= 6 {
+                let tail = n.min(20);
+                let seg: Vec<f32> = hist.iter().rev().take(tail).copied().collect();
+                let half = seg.len() / 2;
+                let recent: f32 = seg[..half].iter().sum::<f32>() / half as f32;
+                let older: f32 = seg[half..].iter().sum::<f32>() / (seg.len() - half) as f32;
+                let eps = older.abs() * 0.01;
+                if recent > older + eps {
+                    ("▲ rising", egui::Color32::from_rgb(0x3c, 0xb3, 0x71))
+                } else if recent < older - eps {
+                    ("▼ falling", egui::Color32::from_rgb(0xc0, 0x39, 0x2b))
+                } else {
+                    ("– steady", egui::Color32::GRAY)
+                }
+            } else {
+                ("…", egui::Color32::GRAY)
+            }
+        };
+
+        ui.horizontal(|ui| {
+            ui.strong(format!("Focus: {:.1}", snap.focus_metric));
+            ui.colored_label(trend.1, trend.0);
+            ui.separator();
+            ui.label(format!("peak {:.1}", snap.focus_peak));
+            if snap.focus_peak > 0.0 {
+                ui.weak(format!("{:.0}% of peak", 100.0 * snap.focus_metric / snap.focus_peak));
+            }
+        });
+
+        let line: PlotPoints = hist
+            .iter()
+            .enumerate()
+            .map(|(i, v)| [i as f64, *v as f64])
+            .collect();
+        let n = hist.len();
+        let window = 300usize;
+        let x_min = n.saturating_sub(window) as f64;
+        let x_max = n.max(window) as f64;
+        let peak = snap.focus_peak as f64;
+        Plot::new("focus_plot")
+            .height(90.0)
+            .show_axes([false, true])
+            .allow_zoom(false)
+            .allow_drag(false)
+            .allow_scroll(false)
+            .allow_boxed_zoom(false)
+            .include_x(x_min)
+            .include_x(x_max)
+            .include_y(0.0)
+            .show(ui, |plot_ui| {
+                // Faint peak line so the user sees how close the current reading is to best focus.
+                if peak > 0.0 {
+                    plot_ui.hline(
+                        HLine::new("", peak)
+                            .color(egui::Color32::from_gray(90))
+                            .width(0.5),
+                    );
+                }
+                plot_ui.line(Line::new("focus", line));
             });
     }
 
