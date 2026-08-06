@@ -115,13 +115,41 @@ impl Camera {
         Ok(())
     }
 
+    /// Resolve the (property, element) this camera uses for gain. Standard INDI CCD drivers expose
+    /// `CCD_GAIN.GAIN`, but PlayerOne cameras have **no** `CCD_GAIN` — gain lives in
+    /// `CCD_CONTROLS.Gain`. We inspect the device's actual property set (a non-blocking read; no 1 s
+    /// `parameter()` wait) rather than assuming, because `change("CCD_GAIN", …)` on a camera that
+    /// lacks it never resolves the property and times out as `NotifyError(Timeout)` on every call.
+    async fn gain_target(&self) -> Result<(&'static str, &'static str)> {
+        let names = {
+            let guard = self.dev.read().await;
+            guard.parameter_names().clone()
+        };
+        if names.iter().any(|n| n == "CCD_GAIN") {
+            Ok(("CCD_GAIN", "GAIN"))
+        } else if names.iter().any(|n| n == "CCD_CONTROLS") {
+            Ok(("CCD_CONTROLS", "Gain"))
+        } else {
+            Err(anyhow!(
+                "camera exposes no gain property (neither CCD_GAIN nor CCD_CONTROLS)"
+            ))
+        }
+    }
+
     pub async fn set_gain(&self, gain: f64) -> Result<()> {
+        let (prop, elem) = self.gain_target().await?;
         let _ = self
             .dev
-            .change("CCD_GAIN", vec![("GAIN", Sexagesimal::from(gain))])
+            .change(prop, vec![(elem, Sexagesimal::from(gain))])
             .await
             .map_err(|e| anyhow!("setting gain: {e:?}"))?;
         Ok(())
+    }
+
+    /// Current gain value and valid range, from whichever property this camera exposes gain on.
+    pub async fn gain_range(&self) -> Option<(f64, f64, f64)> {
+        let (prop, elem) = self.gain_target().await.ok()?;
+        self.number_range(prop, elem).await
     }
 
     /// Set the still-frame exposure in seconds (`CCD_EXPOSURE`).

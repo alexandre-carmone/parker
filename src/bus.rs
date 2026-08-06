@@ -464,6 +464,11 @@ pub struct Bus {
     pub focus_enabled: Arc<AtomicBool>,
     /// Set by the GUI to ask the decode thread to clear its peak-hold / EMA / history.
     pub focus_reset: Arc<AtomicBool>,
+
+    /// Wall-clock (epoch millis) when the frame reader last handed a raw frame to the decoder.
+    /// Stamped by the reader task at wire speed; read by the worker's 1 Hz stall watchdog to
+    /// detect a stream that has silently stopped delivering frames. `0` until the first frame.
+    pub last_frame_ms: Arc<AtomicU64>,
 }
 
 impl Bus {
@@ -487,7 +492,22 @@ impl Bus {
             last_raw_len: Arc::new(AtomicUsize::new(0)),
             focus_enabled: Arc::new(AtomicBool::new(false)),
             focus_reset: Arc::new(AtomicBool::new(false)),
+            last_frame_ms: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Reader task: record that a frame was just delivered (epoch millis). Lock-free.
+    pub fn mark_frame(&self) {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.last_frame_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Worker watchdog: epoch millis of the last delivered frame (`0` = none yet).
+    pub fn last_frame_ms(&self) -> u64 {
+        self.last_frame_ms.load(Ordering::Relaxed)
     }
 
     /// Convenience: append a log line, ignoring lock poisoning.

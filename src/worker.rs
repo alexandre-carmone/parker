@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Result};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::task::JoinHandle;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::StreamExt;
 
 use indi::client::active_device::ActiveDevice;
@@ -81,6 +82,11 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
     let mut panel_refresh = tokio::time::interval(Duration::from_millis(1000));
     panel_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Stall watchdog state (edge-triggered): logged once when frame delivery stalls while the
+    // stream is supposedly on, and once again when frames resume. Diagnoses the "stream stops on
+    // its own after a while" symptom by timestamping the exact moment delivery ceases.
+    let mut stall_logged = false;
+
     loop {
         let cmd = tokio::select! {
             maybe_cmd = rx.recv() => match maybe_cmd {
@@ -92,6 +98,7 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                     refresh_panels(s, &bus).await;
                     ctx.request_repaint();
                 }
+                check_stream_stall(&bus, &mut stall_logged);
                 continue;
             }
         };
@@ -142,6 +149,11 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                         if let Some(dev) = s.frame_device() {
                             frame_task = spawn_frame_task(dev, bus.clone(), ctx.clone()).await;
                         }
+                        if s.blob_isolated() {
+                            bus.log("blob isolation active (dedicated frame connection)");
+                        } else {
+                            bus.log("blob isolation FAILED — frames share the control connection (control commands may time out during streaming)");
+                        }
                         session = Some(s);
                         set_conn(&bus, ConnState::Connected);
                         bus.log("connected");
@@ -176,6 +188,9 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                         Ok(()) => {
                             if let Some(fs) = frame_task.take() {
                                 fs.shutdown();
+                            }
+                            if !s.blob_isolated() {
+                                bus.log("blob isolation FAILED — frames share the control connection (control commands may time out during streaming)");
                             }
                             if let Ok(mut sh) = bus.shared.lock() {
                                 sh.camera_sel = name.clone();
@@ -885,14 +900,36 @@ async fn spawn_frame_task(
 
     // Reader task: drain the camera broadcast as fast as it delivers, handing the newest raw
     // frame to the decode thread. It never decodes, so `indi` rarely lags on our account.
+    //
+    // Instrumented for stall diagnosis: it counts lagged-broadcast events (instead of silently
+    // skipping), stamps `bus.last_frame_ms` on every delivered frame (feeding the worker's stall
+    // watchdog), and logs when the `changes()` stream ends — which is the exact "the stream died"
+    // moment (the blob device store / connection was torn down) that is otherwise invisible.
     let reader = {
         let slot = slot.clone();
+        let bus = bus.clone();
         tokio::spawn(async move {
+            let started = Instant::now();
+            let mut frames: u64 = 0;
+            let mut lagged: u64 = 0;
+            let mut last_lag_log = Instant::now();
             let mut changes = param.changes();
             while let Some(update) = changes.next().await {
                 let param = match update {
                     Ok(p) => p,
-                    Err(_) => continue, // lagged broadcast; skip
+                    Err(e) => {
+                        // Broadcast lag: the reader fell behind and the channel dropped frames.
+                        // Tally and log at most ~1/s so we can tell *lagging* from *dead*.
+                        let BroadcastStreamRecvError::Lagged(n) = e;
+                        lagged += n;
+                        if last_lag_log.elapsed() >= Duration::from_secs(1) {
+                            tracing::warn!(
+                                "blob reader lagged: {lagged} frames dropped so far ({frames} delivered)"
+                            );
+                            last_lag_log = Instant::now();
+                        }
+                        continue;
+                    }
                 };
                 let Parameter::BlobVector(bv) = param.as_ref() else {
                     continue;
@@ -908,7 +945,16 @@ async fn spawn_frame_task(
                     data: data.clone(),
                     format: blob.format.clone(),
                 });
+                frames += 1;
+                bus.mark_frame();
             }
+            // `changes()` yielded `None`: the blob broadcast ended, so the device store behind it
+            // was dropped (connection closed / camera rebound). No more frames will arrive.
+            tracing::warn!(
+                "blob reader stream ended after {frames} frames, {lagged} lagged, {:.1}s uptime — frame delivery stopped",
+                started.elapsed().as_secs_f64()
+            );
+            bus.log("frame stream ended (blob connection closed)");
         })
     };
 
@@ -936,8 +982,15 @@ fn decode_frame(bus: &Bus, raw: &RawFrame, seq: u64) -> Result<Frame> {
         return Frame::from_stream_blob(fmt, &raw.data, seq);
     }
 
+    // Trust the driver's per-frame format label: only inflate when it says compressed (ends `.z`),
+    // or when there is NO label at all and the bytes sniff as zlib. Sniffing a *labeled*
+    // uncompressed `.stream` frame caused false positives — a raw 16-bit frame whose first two bytes
+    // coincidentally form a valid zlib header (`(b0 & 0x0F)==8` and `(b0<<8|b1) % 31 == 0`) was
+    // misrouted to the inflater and failed as "corrupt deflate stream", dropping the frame. This is
+    // content-dependent, so it struck intermittently and more often on bright/high-entropy frames.
     let label_zlib = fmt.map(|f| f.ends_with(".z")).unwrap_or(false);
-    if label_zlib || looks_like_zlib(&raw.data) {
+    let sniff_zlib = fmt.is_none() && looks_like_zlib(&raw.data);
+    if label_zlib || sniff_zlib {
         // Compressed raw: we must inflate for the display decode anyway, so reuse the buffer.
         let pixels = inflate_zlib(&raw.data).map_err(|e| anyhow!("inflating raw stream: {e}"))?;
         bus.set_last_raw_len(pixels.len());
@@ -1036,7 +1089,7 @@ async fn dispatch(cmd: Command, s: &Session, bus: &Bus) -> Result<()> {
             if let Ok(mut sh) = bus.shared.lock() {
                 sh.gain = v;
             }
-            match cam.number_range("CCD_GAIN", "GAIN").await {
+            match cam.gain_range().await {
                 Some((val, min, max)) => {
                     bus.log(format!("gain → {val:.0} (valid {min:.0}–{max:.0})"))
                 }
@@ -1267,6 +1320,44 @@ async fn relock(bus: &Bus) {
 fn set_streaming(bus: &Bus, on: bool) {
     if let Ok(mut sh) = bus.shared.lock() {
         sh.streaming = on;
+    }
+}
+
+/// Diagnostic stall watchdog, driven off the 1 Hz panel tick. While the stream is supposedly on,
+/// warn **once** when the reader stops delivering frames for longer than `STALL_THRESHOLD_MS`, and
+/// once more when delivery resumes. This timestamps the "stream stops on its own" symptom so it can
+/// be correlated with the reader-exit / connection-`io` / lock-timeout logs. Purely observational.
+fn check_stream_stall(bus: &Bus, stall_logged: &mut bool) {
+    const STALL_THRESHOLD_MS: u64 = 2000;
+    let (streaming, frame_count) = match bus.shared.lock() {
+        Ok(sh) => (sh.streaming, sh.frame_count),
+        Err(_) => return,
+    };
+    if !streaming {
+        *stall_logged = false;
+        return;
+    }
+    let last = bus.last_frame_ms();
+    if last == 0 {
+        return; // no frame delivered yet since connect — nothing to compare against
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let since = now.saturating_sub(last);
+    if since >= STALL_THRESHOLD_MS {
+        if !*stall_logged {
+            *stall_logged = true;
+            bus.log(format!(
+                "stream stalled: no frame for {:.1}s (frames so far: {frame_count})",
+                since as f64 / 1000.0
+            ));
+            tracing::warn!("stream stall: no frame for {since}ms, frame_count={frame_count}");
+        }
+    } else if *stall_logged {
+        *stall_logged = false;
+        bus.log("stream frames resumed");
     }
 }
 

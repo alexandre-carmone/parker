@@ -84,7 +84,7 @@ impl Drop for Session {
 /// Connect to `addr` (e.g. `127.0.0.1:7624`), request all properties, auto-discover the
 /// camera (CCD) and mount (telescope) devices by their driver interface, then connect them.
 pub async fn connect(addr: &str) -> Result<Session> {
-    let (client, io) = open_connection(addr).await?;
+    let (client, io) = open_connection(addr, "control").await?;
 
     let (camera_pick, mount_pick) = discover(&client).await;
     if camera_pick.is_none() && mount_pick.is_none() {
@@ -141,14 +141,25 @@ pub async fn connect(addr: &str) -> Result<Session> {
 }
 
 /// Open an INDI connection to `addr`, spawn its I/O task, and request all properties (which
-/// `indi::client::start` does not do on its own).
-async fn open_connection(addr: &str) -> Result<(Client, tokio::task::JoinHandle<()>)> {
+/// `indi::client::start` does not do on its own). `label` (e.g. "control" / "blob") tags the I/O
+/// task's exit log — `indi::client::start` returns only when the socket's reader/writer loop ends,
+/// so a log line here is the "this connection died" signal we watch for when the stream stalls.
+/// (The task is `abort()`ed on Session/BlobLink drop, which cancels it *before* the log, so the
+/// line only fires on an unexpected exit, not on our own teardown.)
+async fn open_connection(
+    addr: &str,
+    label: &'static str,
+) -> Result<(Client, tokio::task::JoinHandle<()>)> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let client = Client::new(Some(tx));
     let stream = TcpStream::connect(addr)
         .await
         .map_err(|e| anyhow!("connecting to indiserver at {addr}: {e}"))?;
-    let io = tokio::spawn(indi::client::start(client.get_devices().clone(), rx, stream));
+    let devices = client.get_devices().clone();
+    let io = tokio::spawn(async move {
+        indi::client::start(devices, rx, stream).await;
+        tracing::warn!("INDI {label} connection I/O task exited (socket closed / reader ended)");
+    });
     client
         .send(indi::serialization::Command::GetProperties(
             indi::serialization::GetProperties {
@@ -168,7 +179,12 @@ async fn open_connection(addr: &str) -> Result<(Client, tokio::task::JoinHandle<
 async fn bind_blob(addr: &str, cam: &Camera, name: &str) -> Option<BlobLink> {
     match setup_blob_link(addr, name).await {
         Ok(link) => match cam.set_blob(indi::BlobEnable::Never).await {
-            Ok(()) => Some(link),
+            Ok(()) => {
+                tracing::info!(
+                    "blob isolation active: frames on a dedicated connection, control set to Never"
+                );
+                Some(link)
+            }
             Err(e) => {
                 tracing::warn!("blob isolation: control connection set_blob(Never) failed: {e:#}");
                 link.io.abort();
@@ -196,7 +212,7 @@ async fn fallback_blob(cam: &Camera) {
 
 /// Open a second connection and bind `name`'s camera device on it as blob-only.
 async fn setup_blob_link(addr: &str, name: &str) -> Result<BlobLink> {
-    let (client, io) = open_connection(addr).await?;
+    let (client, io) = open_connection(addr, "blob").await?;
     let dev = match client.get_device(name).await {
         Ok(d) => d,
         Err(e) => {
@@ -220,6 +236,13 @@ impl Session {
     /// Names of all telescope-interface devices the server currently reports, sorted.
     pub async fn mounts(&self) -> Vec<String> {
         list_by_interface(&self.client, TELESCOPE_INTERFACE).await
+    }
+
+    /// Whether video BLOBs are isolated on their own connection (`true`) or falling back onto the
+    /// shared control connection (`false`). Surfaced to the log because the fallback is the exact
+    /// shared-socket starvation scenario that makes control `change()`s time out during streaming.
+    pub fn blob_isolated(&self) -> bool {
+        self.blob.is_some()
     }
 
     /// The device the worker should subscribe to for CCD1 frames: the dedicated blob connection
