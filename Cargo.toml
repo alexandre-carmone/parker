@@ -14,6 +14,9 @@ tokio-stream = "0.1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Non-blocking, daily-rolling file appender for the persistent diagnostic log (keeps file I/O
+# off the tracing hot path so high-FPS decode timing isn't perturbed).
+tracing-appender = "0.2"
 eframe = "0.35"
 egui = "0.35"
 # egui_plot is versioned one minor ahead of egui: egui_plot 0.36 depends on egui 0.35

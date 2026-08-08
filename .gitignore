@@ -3,3 +3,4 @@ Cargo.lock
 result
 *.png
 *.ser
+/logs

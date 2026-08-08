@@ -1329,8 +1329,11 @@ fn set_streaming(bus: &Bus, on: bool) {
 /// be correlated with the reader-exit / connection-`io` / lock-timeout logs. Purely observational.
 fn check_stream_stall(bus: &Bus, stall_logged: &mut bool) {
     const STALL_THRESHOLD_MS: u64 = 2000;
-    let (streaming, frame_count) = match bus.shared.lock() {
-        Ok(sh) => (sh.streaming, sh.frame_count),
+    // Heartbeat cadence for the deep file log: one line every ~5 ticks (~5s) so a freeze's
+    // lead-up (gradual FPS decay vs. instant drop) is reconstructable after the fact.
+    const HEARTBEAT_TICKS: u64 = 5;
+    let (streaming, frame_count, fps) = match bus.shared.lock() {
+        Ok(sh) => (sh.streaming, sh.frame_count, sh.fps),
         Err(_) => return,
     };
     if !streaming {
@@ -1346,6 +1349,12 @@ fn check_stream_stall(bus: &Bus, stall_logged: &mut bool) {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let since = now.saturating_sub(last);
+    // Periodic heartbeat (file log only, at debug) — builds a timeline of fps + frame count +
+    // gap-since-last-frame that a freeze investigation can read backwards from.
+    static HEARTBEAT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if HEARTBEAT.fetch_add(1, Ordering::Relaxed) % HEARTBEAT_TICKS == 0 {
+        tracing::debug!(frame_count, fps, since_last_frame_ms = since, "stream heartbeat");
+    }
     if since >= STALL_THRESHOLD_MS {
         if !*stall_logged {
             *stall_logged = true;
