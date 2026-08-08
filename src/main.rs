@@ -45,6 +45,8 @@ fn main() -> eframe::Result<()> {
         Box::new(move |cc| {
             // The worker needs the egui Context (created by eframe) to request repaints.
             let ctx = cc.egui_ctx.clone();
+            // Use the light (white) theme for the UI.
+            cc.egui_ctx.set_theme(egui::Theme::Light);
             rt.spawn(worker::run(rx, bus_worker, ctx));
             Ok(Box::new(app::App::new(bus, tx, rt)))
         }),
