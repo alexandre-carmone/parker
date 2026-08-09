@@ -64,6 +64,9 @@ pub struct App {
     /// Sensor size the `roi_*` inputs were last seeded from, so a camera swap (new geometry)
     /// reseeds them to the new full frame. `(0, 0)` until first seeded.
     roi_seeded_for: (u32, u32),
+    /// Pending symmetric binning selection (1 = unbinned). Seeded from the driver alongside the
+    /// ROI inputs; applied immediately on change.
+    bin_input: u32,
     /// In-progress ROI drag on the live view: (start, current) in screen coordinates.
     roi_drag: Option<(egui::Pos2, egui::Pos2)>,
 
@@ -136,6 +139,7 @@ impl App {
             roi_w: 0,
             roi_h: 0,
             roi_seeded_for: (0, 0),
+            bin_input: 1,
             roi_drag: None,
             guide_mode: GuideMode::Disk,
             guide_params: GuideParams::default(),
@@ -217,6 +221,7 @@ struct Snap {
     sensor_w: u32,
     sensor_h: u32,
     roi: (u32, u32, u32, u32),
+    binning: u32,
     // recording (M3)
     stream_switches: Vec<CameraSwitch>,
     /// Effective streamed bit depth inferred from the raw payload (`None` for MJPEG/unknown).
@@ -264,6 +269,7 @@ impl App {
             sensor_w: sh.sensor_w,
             sensor_h: sh.sensor_h,
             roi: sh.roi,
+            binning: sh.binning,
             stream_switches: sh.stream_switches.clone(),
             stream_depth: stream_depth(&self.bus),
             recording: sh.recording.clone(),
@@ -343,6 +349,7 @@ impl eframe::App for App {
             self.roi_y = y as i64;
             self.roi_w = w as i64;
             self.roi_h = h as i64;
+            self.bin_input = snap.binning.max(1);
         }
 
         // ---- Top bar: connection + status ----
@@ -495,6 +502,23 @@ impl eframe::App for App {
                             self.roi_h = snap.sensor_h as i64;
                             self.send(Command::ResetRoi);
                         }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Binning");
+                        egui::ComboBox::from_id_salt("binning")
+                            .selected_text(format!("{0}×{0}", self.bin_input))
+                            .show_ui(ui, |ui| {
+                                for bin in 1..=4u32 {
+                                    if ui
+                                        .selectable_label(bin == self.bin_input, format!("{bin}×{bin}"))
+                                        .clicked()
+                                        && bin != self.bin_input
+                                    {
+                                        self.bin_input = bin;
+                                        self.send(Command::SetBinning { bin });
+                                    }
+                                }
+                            });
                     });
                 });
             });

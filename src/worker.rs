@@ -144,6 +144,7 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                             sh.mount_sel = s.mount_name.clone();
                         }
                         init_sensor_size(&s, &bus).await;
+                        init_binning(&s, &bus).await;
                         init_camera_formats(&s, &bus).await;
                         refresh_panels(&s, &bus).await;
                         if let Some(dev) = s.frame_device() {
@@ -198,6 +199,7 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                                 sh.fps = 0.0;
                             }
                             init_sensor_size(s, &bus).await;
+                            init_binning(s, &bus).await;
                             init_camera_formats(s, &bus).await;
                             refresh_panels(s, &bus).await;
                             if let Some(dev) = s.frame_device() {
@@ -305,7 +307,10 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                 // changes invalidate an in-progress recording's geometry, so stop it too.
                 if matches!(
                     other,
-                    Command::StopStream | Command::SetRoi { .. } | Command::ResetRoi
+                    Command::StopStream
+                        | Command::SetRoi { .. }
+                        | Command::ResetRoi
+                        | Command::SetBinning { .. }
                 ) {
                     if guide_loop.is_some() {
                         stop_guiding(&mut guide_loop, &mut calib_task, &bus);
@@ -431,6 +436,17 @@ async fn init_sensor_size(s: &Session, bus: &Bus) {
             bus.log(format!("sensor: {w}×{h}"));
         }
         Err(e) => bus.log(format!("reading sensor size: {e}")),
+    }
+}
+
+/// Read the bound camera's current binning factor into [`Shared`] so the UI dropdown reflects the
+/// driver's actual value. Best-effort: leaves the default (1) if `CCD_BINNING` is absent.
+async fn init_binning(s: &Session, bus: &Bus) {
+    let Some(cam) = s.camera.as_ref() else { return };
+    if let Some(bin) = cam.binning().await {
+        if let Ok(mut sh) = bus.shared.lock() {
+            sh.binning = bin;
+        }
     }
 }
 
@@ -1231,6 +1247,7 @@ async fn dispatch(cmd: Command, s: &Session, bus: &Bus) -> Result<()> {
             }
             set_roi(s, bus, 0, 0, w, h).await?;
         }
+        Command::SetBinning { bin } => set_binning(s, bus, bin).await?,
         Command::SetIndiSwitch {
             device,
             prop,
@@ -1406,6 +1423,49 @@ async fn set_roi(s: &Session, bus: &Bus, x: u32, y: u32, w: u32, h: u32) -> Resu
         ));
     } else {
         bus.log(format!("ROI set to {aw}×{ah} at ({ax},{ay})"));
+    }
+    Ok(())
+}
+
+/// Apply symmetric on-sensor binning to the camera. Like [`set_roi`], binning changes the streamed
+/// frame's pixel dimensions, so if a stream is running we stop it, set `CCD_BINNING`, read back the
+/// applied geometry, and restart. The applied factor is recorded in [`Shared::binning`] and the
+/// geometry in [`Shared::roi`].
+async fn set_binning(s: &Session, bus: &Bus, bin: u32) -> Result<()> {
+    let cam = camera(s)?;
+    let streaming = bus
+        .shared
+        .lock()
+        .map(|sh| sh.streaming)
+        .unwrap_or(false);
+    if streaming {
+        cam.stop_stream().await?;
+    }
+    let result = cam.set_binning(bin).await;
+    // Binning divides the frame size; use the driver-applied dimensions for the decode geometry so
+    // raw frames pass the size check. Read back before restarting so the first frames already match.
+    let applied = cam.read_applied_roi().await.ok();
+    if let Some((_, _, aw, ah)) = applied {
+        bus.set_stream_geometry(aw, ah);
+    }
+    if streaming {
+        // Best-effort restart even if the binning change failed, so the stream isn't left off.
+        if let Err(e) = cam.start_stream().await {
+            bus.log(format!("restarting stream after binning change failed: {e}"));
+        }
+    }
+    result?;
+    if let Ok(mut sh) = bus.shared.lock() {
+        sh.binning = bin;
+        if let Some(roi) = applied {
+            sh.roi = roi;
+        }
+    }
+    match applied {
+        Some((ax, ay, aw, ah)) => {
+            bus.log(format!("binning → {bin}×{bin} (frame {aw}×{ah} at ({ax},{ay}))"))
+        }
+        None => bus.log(format!("binning → {bin}×{bin}")),
     }
     Ok(())
 }

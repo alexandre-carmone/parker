@@ -321,6 +321,33 @@ impl Camera {
         Ok(())
     }
 
+    /// Set symmetric on-sensor binning via `CCD_BINNING` (`HOR_BIN` = `VER_BIN` = `bin`). Both
+    /// elements are sent together so the driver applies a consistent factor. Binning divides the
+    /// streamed frame dimensions, so callers must re-read the applied geometry (`read_applied_roi`)
+    /// afterwards, exactly as for a `CCD_FRAME` change.
+    pub async fn set_binning(&self, bin: u32) -> Result<()> {
+        let _ = self
+            .dev
+            .change(
+                "CCD_BINNING",
+                vec![
+                    ("HOR_BIN", Sexagesimal::from(bin as f64)),
+                    ("VER_BIN", Sexagesimal::from(bin as f64)),
+                ],
+            )
+            .await
+            .map_err(|e| anyhow!("setting CCD binning: {e:?}"))?;
+        Ok(())
+    }
+
+    /// Read the driver's current symmetric binning factor (`CCD_BINNING` → `HOR_BIN`). `None` if
+    /// the property is absent or not a number vector. Used to seed the UI on connect / camera swap.
+    pub async fn binning(&self) -> Option<u32> {
+        self.number_range("CCD_BINNING", "HOR_BIN")
+            .await
+            .map(|(v, _, _)| v as u32)
+    }
+
     /// Read the readout region the driver actually applied, as `(x, y, w, h)`. Drivers snap the
     /// requested width/height to hardware alignment (e.g. the Player One rounds width down to a
     /// multiple of 8), so the streamed frame size can differ from what we asked for — we must use

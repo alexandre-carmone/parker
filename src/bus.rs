@@ -52,6 +52,8 @@ pub enum Command {
     SetRoi { x: u32, y: u32, w: u32, h: u32 },
     /// Reset the camera readout to the full sensor.
     ResetRoi,
+    /// Set symmetric on-sensor binning (`CCD_BINNING` `HOR_BIN`/`VER_BIN`), 1 = unbinned.
+    SetBinning { bin: u32 },
 
     // ---- recording (M3) ----
     /// Turn on element `elem` of the camera switch property `prop` — used for the driver's
@@ -302,6 +304,8 @@ pub struct Shared {
     pub sensor_h: u32,
     /// Currently-applied readout region `(x, y, w, h)` in sensor pixels (full sensor by default).
     pub roi: (u32, u32, u32, u32),
+    /// Currently-applied symmetric binning factor (`CCD_BINNING`), 1 = unbinned.
+    pub binning: u32,
 
     // ---- recording (M3) ----
     /// The camera's stream-format switch properties (encoder, video format, bit depth, sensor
@@ -380,6 +384,7 @@ impl Default for Shared {
             sensor_w: 0,
             sensor_h: 0,
             roi: (0, 0, 0, 0),
+            binning: 1,
             stream_switches: Vec::new(),
             recording: RecordStatus::default(),
             camera_panel: None,
