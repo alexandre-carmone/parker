@@ -13,11 +13,18 @@ use crate::bus::{
 };
 use crate::guiding::{Calibration, DecMode, GuideMode, GuideParams, DEFAULT_CALIB_MS};
 
-const DIRS: [(Dir, &str); 4] = [
-    (Dir::North, "N"),
-    (Dir::South, "S"),
-    (Dir::East, "E"),
-    (Dir::West, "W"),
+/// The 8 directional buttons of the nudge pad, in row-major 3×3 order (the center cell is a Stop
+/// button, handled separately). Each button fires one `Nudge` per listed cardinal direction, so a
+/// corner drives both the NS and WE motion axes at once for a true diagonal slew.
+const NUDGE_BUTTONS: [(&str, &[Dir]); 8] = [
+    ("↖", &[Dir::North, Dir::West]),
+    ("N", &[Dir::North]),
+    ("↗", &[Dir::North, Dir::East]),
+    ("W", &[Dir::West]),
+    ("E", &[Dir::East]),
+    ("↙", &[Dir::South, Dir::West]),
+    ("S", &[Dir::South]),
+    ("↘", &[Dir::South, Dir::East]),
 ];
 
 pub struct App {
@@ -31,8 +38,9 @@ pub struct App {
     texture: Option<egui::TextureHandle>,
     /// Last display image seq uploaded to the texture (the streaming fast path).
     last_display_seq: u64,
-    /// Per-direction "currently held" state for press-and-hold nudging (N, S, E, W).
-    nudge_down: [bool; 4],
+    /// Per-button "currently held" state for press-and-hold nudging, indexed into
+    /// [`NUDGE_BUTTONS`] (8 directions: 4 cardinal + 4 diagonal).
+    nudge_down: [bool; 8],
     gain_input: f64,
     exposure_input: f64,
 
@@ -123,7 +131,7 @@ impl App {
             capture_dir: "captures".to_owned(),
             texture: None,
             last_display_seq: 0,
-            nudge_down: [false; 4],
+            nudge_down: [false; 8],
             gain_input: 215.0,
             exposure_input: 0.002,
             auto_stretch: true,
@@ -214,8 +222,10 @@ struct Snap {
     mounts: Vec<String>,
     camera_sel: String,
     mount_sel: String,
-    slew_rates: Vec<String>,
+    slew_rates: Vec<(String, String)>,
     slew_rate_idx: usize,
+    track_modes: Vec<(String, String)>,
+    track_mode_idx: usize,
     tracking: bool,
     last_capture: Option<String>,
     sensor_w: u32,
@@ -264,6 +274,8 @@ impl App {
             mount_sel: sh.mount_sel.clone(),
             slew_rates: sh.slew_rates.clone(),
             slew_rate_idx: sh.slew_rate_idx,
+            track_modes: sh.track_modes.clone(),
+            track_mode_idx: sh.track_mode_idx,
             tracking: sh.tracking,
             last_capture: sh.last_capture.clone(),
             sensor_w: sh.sensor_w,
@@ -601,14 +613,14 @@ impl eframe::App for App {
                         let current = snap
                             .slew_rates
                             .get(snap.slew_rate_idx)
-                            .cloned()
+                            .map(|(_, label)| label.clone())
                             .unwrap_or_default();
                         egui::ComboBox::from_id_salt("slew")
                             .selected_text(current)
                             .show_ui(ui, |ui| {
-                                for (i, name) in snap.slew_rates.iter().enumerate() {
+                                for (i, (_, label)) in snap.slew_rates.iter().enumerate() {
                                     if ui
-                                        .selectable_label(i == snap.slew_rate_idx, name)
+                                        .selectable_label(i == snap.slew_rate_idx, label)
                                         .clicked()
                                     {
                                         self.send(Command::SetSlewRate(i));
@@ -621,6 +633,31 @@ impl eframe::App for App {
                 let mut tracking = snap.tracking;
                 if ui.checkbox(&mut tracking, "Tracking").clicked() {
                     self.send(Command::SetTracking(tracking));
+                }
+                // Tracking mode (sidereal/solar/lunar/…), if the mount exposes it.
+                if !snap.track_modes.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.label("Track mode:");
+                        let current = snap
+                            .track_modes
+                            .get(snap.track_mode_idx)
+                            .map(|(_, label)| label.clone())
+                            .unwrap_or_default();
+                        ui.add_enabled_ui(snap.tracking, |ui| {
+                            egui::ComboBox::from_id_salt("track_mode")
+                                .selected_text(current)
+                                .show_ui(ui, |ui| {
+                                    for (i, (_, label)) in snap.track_modes.iter().enumerate() {
+                                        if ui
+                                            .selectable_label(i == snap.track_mode_idx, label)
+                                            .clicked()
+                                        {
+                                            self.send(Command::SetTrackMode(i));
+                                        }
+                                    }
+                                });
+                        });
+                    });
                 }
 
                 ui.separator();
@@ -853,33 +890,44 @@ fn save_screenshot(img: &egui::ColorImage, path: &str) {
 }
 
 impl App {
-    /// A 3×3 D-pad; each button starts a nudge on press and stops it on release.
+    /// A 3×3 D-pad. Each of the 8 outer buttons starts a nudge on press and stops it on release;
+    /// corners fire both cardinal axes for a diagonal slew. The center cell is a Stop button.
     fn nudge_pad(&mut self, ui: &mut egui::Ui) {
+        // Capture the two fields the handler needs separately so it borrows disjoint parts of
+        // `self` — this lets the center Stop button also touch `self.tx` between handler calls.
+        let tx = &self.tx;
+        let nudge_down = &mut self.nudge_down;
         let btn = |ui: &mut egui::Ui, label: &str| {
             ui.add_sized([44.0, 32.0], egui::Button::new(label))
         };
-        let mut handle = |ui: &mut egui::Ui, idx: usize, dir: Dir, label: &str| {
-            let resp = btn(ui, label);
-            let down = resp.is_pointer_button_down_on();
-            if down != self.nudge_down[idx] {
-                self.nudge_down[idx] = down;
-                self.send(Command::Nudge { dir, active: down });
+        let mut handle = |ui: &mut egui::Ui, idx: usize| {
+            let (label, dirs) = NUDGE_BUTTONS[idx];
+            let down = btn(ui, label).is_pointer_button_down_on();
+            if down != nudge_down[idx] {
+                nudge_down[idx] = down;
+                for &dir in dirs {
+                    let _ = tx.send(Command::Nudge { dir, active: down });
+                }
             }
         };
 
         ui.vertical_centered(|ui| {
             ui.horizontal(|ui| {
-                ui.add_space(48.0);
-                handle(ui, 0, Dir::North, DIRS[0].1);
+                handle(ui, 0);
+                handle(ui, 1);
+                handle(ui, 2);
             });
             ui.horizontal(|ui| {
-                handle(ui, 3, Dir::West, DIRS[3].1);
-                ui.add_space(48.0);
-                handle(ui, 2, Dir::East, DIRS[2].1);
+                handle(ui, 3);
+                if btn(ui, "⏹").clicked() {
+                    let _ = tx.send(Command::Abort);
+                }
+                handle(ui, 4);
             });
             ui.horizontal(|ui| {
-                ui.add_space(48.0);
-                handle(ui, 1, Dir::South, DIRS[1].1);
+                handle(ui, 5);
+                handle(ui, 6);
+                handle(ui, 7);
             });
         });
     }

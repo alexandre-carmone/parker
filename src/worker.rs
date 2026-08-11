@@ -128,14 +128,7 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                         let cameras = s.cameras().await;
                         let mounts = s.mounts().await;
                         if let Some(m) = &s.mount {
-                            match m.slew_rates().await {
-                                Ok(rates) => {
-                                    if let Ok(mut sh) = bus.shared.lock() {
-                                        sh.slew_rates = rates;
-                                    }
-                                }
-                                Err(e) => bus.log(format!("reading slew rates: {e}")),
-                            }
+                            refresh_mount_controls(m, &bus).await;
                         }
                         if let Ok(mut sh) = bus.shared.lock() {
                             sh.cameras = cameras;
@@ -220,19 +213,10 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                     Some(s) => match s.select_mount(&name).await {
                         Ok(()) => {
                             if let Some(m) = &s.mount {
-                                match m.slew_rates().await {
-                                    Ok(rates) => {
-                                        if let Ok(mut sh) = bus.shared.lock() {
-                                            sh.slew_rates = rates;
-                                            sh.slew_rate_idx = 0;
-                                        }
-                                    }
-                                    Err(e) => bus.log(format!("reading slew rates: {e}")),
-                                }
+                                refresh_mount_controls(m, &bus).await;
                             }
                             if let Ok(mut sh) = bus.shared.lock() {
                                 sh.mount_sel = name.clone();
-                                sh.tracking = false;
                             }
                             refresh_panels(s, &bus).await;
                             bus.log(format!("mount: {name}"));
@@ -1077,6 +1061,43 @@ fn mount(s: &Session) -> Result<&Mount> {
     s.mount.as_ref().ok_or_else(|| anyhow!("no mount selected"))
 }
 
+/// Read the bound mount's slew rates, tracking modes, and tracking state into [`Shared`] so the
+/// GUI reflects the driver's actual current selections. Track-mode is optional (many mounts don't
+/// expose `TELESCOPE_TRACK_MODE`); a failure just clears the list without logging.
+async fn refresh_mount_controls(m: &Mount, bus: &Bus) {
+    let slew = m.slew_rates().await;
+    let modes = m.track_modes().await;
+    let tracking = m.tracking_on().await;
+    if let Ok(mut sh) = bus.shared.lock() {
+        match &slew {
+            Ok((rates, idx)) => {
+                sh.slew_rates = rates.clone();
+                sh.slew_rate_idx = *idx;
+            }
+            Err(_) => {
+                sh.slew_rates.clear();
+                sh.slew_rate_idx = 0;
+            }
+        }
+        match modes {
+            Ok((tm, idx)) => {
+                sh.track_modes = tm;
+                sh.track_mode_idx = idx;
+            }
+            Err(_) => {
+                sh.track_modes.clear();
+                sh.track_mode_idx = 0;
+            }
+        }
+        if let Ok(on) = tracking {
+            sh.tracking = on;
+        }
+    }
+    if let Err(e) = slew {
+        bus.log(format!("reading slew rates: {e}"));
+    }
+}
+
 /// Translate a non-lifecycle command into INDI property changes.
 async fn dispatch(cmd: Command, s: &Session, bus: &Bus) -> Result<()> {
     match cmd {
@@ -1167,11 +1188,24 @@ async fn dispatch(cmd: Command, s: &Session, bus: &Bus) -> Result<()> {
                 .shared
                 .lock()
                 .ok()
-                .and_then(|sh| sh.slew_rates.get(idx).cloned());
+                .and_then(|sh| sh.slew_rates.get(idx).map(|(name, _)| name.clone()));
             if let Some(name) = name {
                 mount(s)?.set_slew_rate(&name).await?;
                 if let Ok(mut sh) = bus.shared.lock() {
                     sh.slew_rate_idx = idx;
+                }
+            }
+        }
+        Command::SetTrackMode(idx) => {
+            let name = bus
+                .shared
+                .lock()
+                .ok()
+                .and_then(|sh| sh.track_modes.get(idx).map(|(name, _)| name.clone()));
+            if let Some(name) = name {
+                mount(s)?.set_track_mode(&name).await?;
+                if let Ok(mut sh) = bus.shared.lock() {
+                    sh.track_mode_idx = idx;
                 }
             }
         }

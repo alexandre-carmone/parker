@@ -23,6 +23,34 @@ fn motion_target(dir: Dir) -> (&'static str, &'static str) {
     }
 }
 
+/// Extract the first numeric run (digits + `.`) from a label, e.g. `"x0.25"` → `Some(0.25)`.
+fn leading_number(label: &str) -> Option<f64> {
+    let mut num = String::new();
+    let mut started = false;
+    for c in label.chars() {
+        if c.is_ascii_digit() || (c == '.' && started) {
+            num.push(c);
+            started = true;
+        } else if started {
+            break;
+        }
+    }
+    num.parse().ok()
+}
+
+/// Best-effort "slow→fast" ordering of two switch labels. Labels with an embedded number sort
+/// first, by value (`x0.25 < x0.5 < x1 < x2 < x10`); labels without one (Guide, Max, VVF…)
+/// sort after, alphabetically. `HashMap` loses the driver's XML order, so this reconstructs a
+/// sensible one without hard-coding driver-specific element names.
+fn cmp_switch_label(a: &str, b: &str) -> std::cmp::Ordering {
+    match (leading_number(a), leading_number(b)) {
+        (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.cmp(b),
+    }
+}
+
 /// Map a pulse-guide direction to its `TELESCOPE_TIMED_GUIDE_*` number property + element.
 fn guide_target(dir: Dir) -> (&'static str, &'static str) {
     match dir {
@@ -47,20 +75,64 @@ impl Mount {
         Ok(())
     }
 
-    /// Read the driver's `TELESCOPE_SLEW_RATE` switch element names, sorted for stable order.
-    pub async fn slew_rates(&self) -> Result<Vec<String>> {
+    /// Read a `OneOfMany` switch vector as an ordered list of `(element name, display label)`
+    /// pairs plus the index of the currently-selected (`On`) element. Ordered slow→fast via
+    /// [`cmp_switch_label`] since the driver's XML order isn't preserved by the `HashMap`.
+    async fn read_switch_options(&self, prop: &str) -> Result<(Vec<(String, String)>, usize)> {
         let param = self
             .dev
-            .get_parameter("TELESCOPE_SLEW_RATE")
+            .get_parameter(prop)
             .await
-            .map_err(|e| anyhow!("getting slew rates: {e:?}"))?;
+            .map_err(|e| anyhow!("getting {prop}: {e:?}"))?;
         let guard = param.read().await;
         if let Parameter::SwitchVector(sv) = &*guard {
-            let mut names: Vec<String> = sv.values.keys().cloned().collect();
-            names.sort();
-            Ok(names)
+            let mut opts: Vec<(String, String, bool)> = sv
+                .values
+                .iter()
+                .map(|(name, sw)| {
+                    (
+                        name.clone(),
+                        sw.label.clone().unwrap_or_else(|| name.clone()),
+                        sw.value == SwitchState::On,
+                    )
+                })
+                .collect();
+            opts.sort_by(|a, b| cmp_switch_label(&a.1, &b.1));
+            let selected = opts.iter().position(|(_, _, on)| *on).unwrap_or(0);
+            let pairs = opts.into_iter().map(|(n, l, _)| (n, l)).collect();
+            Ok((pairs, selected))
         } else {
-            Err(anyhow!("TELESCOPE_SLEW_RATE is not a switch vector"))
+            Err(anyhow!("{prop} is not a switch vector"))
+        }
+    }
+
+    /// Read `TELESCOPE_SLEW_RATE` as `(element name, label)` pairs plus the selected index.
+    pub async fn slew_rates(&self) -> Result<(Vec<(String, String)>, usize)> {
+        self.read_switch_options("TELESCOPE_SLEW_RATE").await
+    }
+
+    /// Read `TELESCOPE_TRACK_MODE` (Sidereal/Solar/Lunar/Custom) as `(element name, label)` pairs
+    /// plus the selected index. Not all mounts expose it.
+    pub async fn track_modes(&self) -> Result<(Vec<(String, String)>, usize)> {
+        self.read_switch_options("TELESCOPE_TRACK_MODE").await
+    }
+
+    /// Read whether tracking is currently on (`TELESCOPE_TRACK_STATE` `TRACK_ON`).
+    pub async fn tracking_on(&self) -> Result<bool> {
+        let param = self
+            .dev
+            .get_parameter("TELESCOPE_TRACK_STATE")
+            .await
+            .map_err(|e| anyhow!("reading track state: {e:?}"))?;
+        let guard = param.read().await;
+        if let Parameter::SwitchVector(sv) = &*guard {
+            Ok(sv
+                .values
+                .get("TRACK_ON")
+                .map(|s| s.value == SwitchState::On)
+                .unwrap_or(false))
+        } else {
+            Err(anyhow!("TELESCOPE_TRACK_STATE is not a switch vector"))
         }
     }
 
@@ -102,6 +174,15 @@ impl Mount {
             .change("TELESCOPE_SLEW_RATE", vec![(name, true)])
             .await
             .map_err(|e| anyhow!("setting slew rate {name}: {e:?}"))?;
+        Ok(())
+    }
+
+    pub async fn set_track_mode(&self, name: &str) -> Result<()> {
+        let _ = self
+            .dev
+            .change("TELESCOPE_TRACK_MODE", vec![(name, true)])
+            .await
+            .map_err(|e| anyhow!("setting track mode {name}: {e:?}"))?;
         Ok(())
     }
 

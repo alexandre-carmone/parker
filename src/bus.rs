@@ -44,6 +44,8 @@ pub enum Command {
     Nudge { dir: Dir, active: bool },
     /// Slew rate as an index into the driver's `TELESCOPE_SLEW_RATE` switch (0 = slowest).
     SetSlewRate(usize),
+    /// Tracking mode as an index into the driver's `TELESCOPE_TRACK_MODE` switch (sidereal/solar/…).
+    SetTrackMode(usize),
     SetTracking(bool),
     Abort,
     /// Save the current live frame to a timestamped PNG in `dir`.
@@ -294,9 +296,13 @@ pub struct Shared {
     pub mounts: Vec<String>,
     pub camera_sel: String,
     pub mount_sel: String,
-    /// Available slew-rate labels and the selected index.
-    pub slew_rates: Vec<String>,
+    /// Available slew rates as `(element name, display label)` pairs, and the selected index.
+    pub slew_rates: Vec<(String, String)>,
     pub slew_rate_idx: usize,
+    /// Available tracking modes as `(element name, display label)` pairs, and the selected index.
+    /// Empty when the mount doesn't expose `TELESCOPE_TRACK_MODE`.
+    pub track_modes: Vec<(String, String)>,
+    pub track_mode_idx: usize,
     pub tracking: bool,
     pub last_capture: Option<String>,
     /// Full sensor size in pixels (`CCD_INFO`), 0 until a camera is bound. Bounds the ROI controls.
@@ -379,6 +385,8 @@ impl Default for Shared {
             mount_sel: String::new(),
             slew_rates: Vec::new(),
             slew_rate_idx: 0,
+            track_modes: Vec::new(),
+            track_mode_idx: 0,
             tracking: false,
             last_capture: None,
             sensor_w: 0,
