@@ -196,6 +196,51 @@ impl Mount {
         Ok(())
     }
 
+    /// Read the mount's configured geographic location from `GEOGRAPHIC_COORD` as
+    /// `(latitude °N, longitude °E, elevation m)`. INDI reports longitude in 0–360° East.
+    /// Returns `Ok(None)` if the mount doesn't expose the property or its elements — used to
+    /// feed the Moon's topocentric correction, which is optional.
+    pub async fn read_location(&self) -> Result<Option<(f64, f64, f64)>> {
+        let Ok(param) = self.dev.get_parameter("GEOGRAPHIC_COORD").await else {
+            return Ok(None);
+        };
+        let guard = param.read().await;
+        if let Parameter::NumberVector(nv) = &*guard {
+            let get = |name: &str| nv.values.get(name).map(|n| f64::from(n.value));
+            match (get("LAT"), get("LONG"), get("ELEV")) {
+                (Some(lat), Some(long), elev) => Ok(Some((lat, long, elev.unwrap_or(0.0)))),
+                _ => Ok(None),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Slew to and then track equatorial coordinates (`ra_hours` in hours, `dec_deg` in degrees,
+    /// equator/equinox of date). Selects `ON_COORD_SET` = `TRACK` first, then writes
+    /// `EQUATORIAL_EOD_COORD`.
+    ///
+    /// The coordinate write uses `set`, not `change`: a slew holds the property `Busy` for the
+    /// whole (multi-second) motion, so `change` — which waits for it to settle back — would
+    /// never complete (same reason as [`Mount::pulse_guide`]).
+    pub async fn goto(&self, ra_hours: f64, dec_deg: f64) -> Result<()> {
+        let _ = self
+            .dev
+            .change("ON_COORD_SET", vec![("TRACK", true)])
+            .await
+            .map_err(|e| anyhow!("setting ON_COORD_SET: {e:?}"))?;
+        self.dev
+            .parameter("EQUATORIAL_EOD_COORD")
+            .await
+            .map_err(|e| anyhow!("finding EQUATORIAL_EOD_COORD: {e:?}"))?
+            .set(vec![
+                ("RA", Sexagesimal::from(ra_hours)),
+                ("DEC", Sexagesimal::from(dec_deg)),
+            ])
+            .map_err(|e| anyhow!("goto RA={ra_hours} DEC={dec_deg}: {e:?}"))?;
+        Ok(())
+    }
+
     pub async fn abort(&self) -> Result<()> {
         let _ = self
             .dev

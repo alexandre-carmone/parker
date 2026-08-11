@@ -15,6 +15,7 @@ use indi::client::active_device::ActiveDevice;
 use indi::serialization::Sexagesimal;
 use indi::{Parameter, PropertyPerm, PropertyState, SwitchRule, SwitchState}; // external crate; `crate::indi` is our local module
 
+use crate::ephemeris;
 use crate::bus::{
     Bus, CameraSwitch, Command, ConnState, IndiGroup, IndiLight, IndiNumber, IndiPanel, IndiProp,
     IndiState, IndiSwitch, IndiSwitchRule, IndiText, IndiValue, RecordConfig, RecordPhase,
@@ -1241,6 +1242,28 @@ async fn dispatch(cmd: Command, s: &Session, bus: &Bus) -> Result<()> {
             mount(s)?.set_tracking(on).await?;
             if let Ok(mut sh) = bus.shared.lock() {
                 sh.tracking = on;
+            }
+        }
+        Command::GotoObject(obj) => {
+            let m = mount(s)?;
+            // Location only matters for the Moon (topocentric parallax); the Sun and planets are
+            // geocentric, so a missing location still points them correctly.
+            let location = m.read_location().await.ok().flatten();
+            let (lat, lon) = location.map(|(lat, lon, _)| (lat, lon)).unwrap_or((0.0, 0.0));
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            let c = ephemeris::position(obj, now, lat, lon);
+            m.goto(c.ra_hours, c.dec_deg).await?;
+            bus.log(format!(
+                "Go To {}: RA {:.4} h  Dec {:.3}°",
+                obj.label(),
+                c.ra_hours,
+                c.dec_deg
+            ));
+            if obj == ephemeris::SolarObject::Moon && location.is_none() {
+                bus.log("mount location unknown — Moon pointing may be off by up to ~1°");
             }
         }
         Command::Abort => mount(s)?.abort().await?,

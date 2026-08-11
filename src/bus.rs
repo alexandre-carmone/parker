@@ -47,6 +47,9 @@ pub enum Command {
     /// Tracking mode as an index into the driver's `TELESCOPE_TRACK_MODE` switch (sidereal/solar/…).
     SetTrackMode(usize),
     SetTracking(bool),
+    /// Slew to (and track) a solar-system object, computing its current RA/Dec from the system
+    /// clock and the mount's geographic location.
+    GotoObject(crate::ephemeris::SolarObject),
     Abort,
     /// Save the current live frame to a timestamped PNG in `dir`.
     CaptureFrame { dir: String },

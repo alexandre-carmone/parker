@@ -11,6 +11,7 @@ use crate::bus::{
     Bus, CameraSwitch, Command, ConnState, Dir, IndiPanel, IndiState, IndiSwitchRule, IndiValue,
     RecordConfig, RecordPhase, RecordStatus, RecordStop,
 };
+use crate::ephemeris::SolarObject;
 use crate::guiding::{Calibration, DecMode, GuideMode, GuideParams, DEFAULT_CALIB_MS};
 
 /// The 8 directional buttons of the nudge pad, in row-major 3×3 order (the center cell is a Stop
@@ -659,6 +660,16 @@ impl eframe::App for App {
                         });
                     });
                 }
+
+                ui.separator();
+                ui.label("Go To");
+                ui.horizontal_wrapped(|ui| {
+                    for &obj in SolarObject::all() {
+                        if ui.button(obj.label()).clicked() {
+                            self.send(Command::GotoObject(obj));
+                        }
+                    }
+                });
 
                 ui.separator();
                 ui.label("Manual slew (press & hold)");
