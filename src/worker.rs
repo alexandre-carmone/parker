@@ -97,6 +97,11 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
             _ = panel_refresh.tick() => {
                 if let Some(s) = &session {
                     refresh_panels(s, &bus).await;
+                    // Keep tracking/park state live so a park slew (or an external change) is
+                    // reflected once the driver settles the switch.
+                    if let Some(m) = &s.mount {
+                        refresh_mount_controls(m, &bus).await;
+                    }
                     ctx.request_repaint();
                 }
                 check_stream_stall(&bus, &mut stall_logged);
@@ -1097,6 +1102,7 @@ async fn refresh_mount_controls(m: &Mount, bus: &Bus) {
     let slew = m.slew_rates().await;
     let modes = m.track_modes().await;
     let tracking = m.tracking_on().await;
+    let park = m.park_state().await;
     if let Ok(mut sh) = bus.shared.lock() {
         match &slew {
             Ok((rates, idx)) => {
@@ -1120,6 +1126,16 @@ async fn refresh_mount_controls(m: &Mount, bus: &Bus) {
         }
         if let Ok(on) = tracking {
             sh.tracking = on;
+        }
+        match park {
+            Ok(Some(parked)) => {
+                sh.can_park = true;
+                sh.parked = parked;
+            }
+            _ => {
+                sh.can_park = false;
+                sh.parked = false;
+            }
         }
     }
     if let Err(e) = slew {
@@ -1243,6 +1259,12 @@ async fn dispatch(cmd: Command, s: &Session, bus: &Bus) -> Result<()> {
             if let Ok(mut sh) = bus.shared.lock() {
                 sh.tracking = on;
             }
+        }
+        Command::SetPark(on) => {
+            mount(s)?.set_park(on).await?;
+            bus.log(if on { "parking mount" } else { "unparking mount" });
+            // The switch settles asynchronously as the mount slews; `refresh_mount_controls` on
+            // the next tick reflects the true parked state.
         }
         Command::GotoObject(obj) => {
             let m = mount(s)?;

@@ -228,6 +228,8 @@ struct Snap {
     track_modes: Vec<(String, String)>,
     track_mode_idx: usize,
     tracking: bool,
+    can_park: bool,
+    parked: bool,
     last_capture: Option<String>,
     sensor_w: u32,
     sensor_h: u32,
@@ -278,6 +280,8 @@ impl App {
             track_modes: sh.track_modes.clone(),
             track_mode_idx: sh.track_mode_idx,
             tracking: sh.tracking,
+            can_park: sh.can_park,
+            parked: sh.parked,
             last_capture: sh.last_capture.clone(),
             sensor_w: sh.sensor_w,
             sensor_h: sh.sensor_h,
@@ -658,6 +662,29 @@ impl eframe::App for App {
                                     }
                                 });
                         });
+                    });
+                }
+
+                // Park / unpark, if the mount supports it (TELESCOPE_PARK).
+                if snap.can_park {
+                    ui.horizontal(|ui| {
+                        ui.label(if snap.parked {
+                            "Status: Parked"
+                        } else {
+                            "Status: Unparked"
+                        });
+                        if ui
+                            .add_enabled(!snap.parked, egui::Button::new("Park"))
+                            .clicked()
+                        {
+                            self.send(Command::SetPark(true));
+                        }
+                        if ui
+                            .add_enabled(snap.parked, egui::Button::new("Unpark"))
+                            .clicked()
+                        {
+                            self.send(Command::SetPark(false));
+                        }
                     });
                 }
 

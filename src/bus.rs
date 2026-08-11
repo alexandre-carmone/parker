@@ -47,6 +47,8 @@ pub enum Command {
     /// Tracking mode as an index into the driver's `TELESCOPE_TRACK_MODE` switch (sidereal/solar/…).
     SetTrackMode(usize),
     SetTracking(bool),
+    /// Park (`true`) or unpark (`false`) the mount via `TELESCOPE_PARK`.
+    SetPark(bool),
     /// Slew to (and track) a solar-system object, computing its current RA/Dec from the system
     /// clock and the mount's geographic location.
     GotoObject(crate::ephemeris::SolarObject),
@@ -307,6 +309,10 @@ pub struct Shared {
     pub track_modes: Vec<(String, String)>,
     pub track_mode_idx: usize,
     pub tracking: bool,
+    /// Whether the mount exposes `TELESCOPE_PARK` (park controls hidden when false).
+    pub can_park: bool,
+    /// Whether the mount is currently parked.
+    pub parked: bool,
     pub last_capture: Option<String>,
     /// Full sensor size in pixels (`CCD_INFO`), 0 until a camera is bound. Bounds the ROI controls.
     pub sensor_w: u32,
@@ -391,6 +397,8 @@ impl Default for Shared {
             track_modes: Vec::new(),
             track_mode_idx: 0,
             tracking: false,
+            can_park: false,
+            parked: false,
             last_capture: None,
             sensor_w: 0,
             sensor_h: 0,

@@ -196,6 +196,40 @@ impl Mount {
         Ok(())
     }
 
+    /// Read the mount's park state from `TELESCOPE_PARK` (`PARK` element `On` = parked).
+    /// Returns `Ok(None)` if the mount doesn't expose the property — many drivers don't support
+    /// parking, and the UI hides the control in that case.
+    pub async fn park_state(&self) -> Result<Option<bool>> {
+        let Ok(param) = self.dev.get_parameter("TELESCOPE_PARK").await else {
+            return Ok(None);
+        };
+        let guard = param.read().await;
+        if let Parameter::SwitchVector(sv) = &*guard {
+            Ok(sv
+                .values
+                .get("PARK")
+                .map(|s| s.value == SwitchState::On))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Park (`on = true`) or unpark the mount via the `TELESCOPE_PARK` switch.
+    ///
+    /// Fire-and-forget via `set`, not `change`: parking holds the property `Busy` for the whole
+    /// (multi-second) slew to the park position, so `change` — which waits for it to settle back —
+    /// would never complete (same reason as [`Mount::goto`]).
+    pub async fn set_park(&self, on: bool) -> Result<()> {
+        let elem = if on { "PARK" } else { "UNPARK" };
+        self.dev
+            .parameter("TELESCOPE_PARK")
+            .await
+            .map_err(|e| anyhow!("finding TELESCOPE_PARK: {e:?}"))?
+            .set(vec![(elem, true)])
+            .map_err(|e| anyhow!("setting park {on}: {e:?}"))?;
+        Ok(())
+    }
+
     /// Read the mount's configured geographic location from `GEOGRAPHIC_COORD` as
     /// `(latitude °N, longitude °E, elevation m)`. INDI reports longitude in 0–360° East.
     /// Returns `Ok(None)` if the mount doesn't expose the property or its elements — used to
