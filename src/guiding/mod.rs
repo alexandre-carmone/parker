@@ -126,6 +126,11 @@ async fn calibrate(mount: &Mount, bus: &Bus, pulse_ms: f32) -> Option<Calibratio
 /// compute the error against the lock point, and issue the correcting pulse-guides. Runs until
 /// `stop` is set. Reads params/lock/calibration live from [`crate::bus::Shared`].
 pub async fn run_guide_loop(mount: Mount, bus: Bus, ctx: egui::Context, stop: Arc<AtomicBool>) {
+    // Sequence of the last detector sample we acted on. We must never correct twice on the same
+    // measurement: if detection stops publishing (target lost) or the cadence is shorter than the
+    // detector/settle latency, re-applying a stale error would over-correct and drive the mount
+    // away. A lost target therefore pauses corrections until a fresh sample arrives.
+    let mut last_seq = 0u64;
     while !stop.load(Ordering::Relaxed) {
         let (params, lock, calib) = {
             let sh = bus.shared.lock().unwrap();
@@ -142,6 +147,11 @@ pub async fn run_guide_loop(mount: Mount, bus: Bus, ctx: egui::Context, stop: Ar
         let Some(sample) = bus.guide_sample.load_full() else {
             continue;
         };
+        // Only act on a measurement newer than the last one we corrected on.
+        if sample.seq <= last_seq {
+            continue;
+        }
+        last_seq = sample.seq;
         // Raw sensor error drives the correction; the telemetry is the same error decomposed onto
         // the mount's RA/DEC axes (what guiders actually graph), which is meaningful even when the
         // camera is rotated relative to the sensor.
