@@ -1661,8 +1661,15 @@ async fn start_recording(
 /// **not** abort the task, so it stays alive long enough to send `RECORD_OFF` to the driver and
 /// clear its own state. Safe to call when not recording. The optimistic `Shared` clear here just
 /// updates the UI immediately; the task also clears it on exit.
+///
+/// The task handle is **retained** (not `take`n): the orchestrator keeps running for up to ~250 ms
+/// after the flag is set, until it observes the stop and sends `RECORD_OFF`. If we dropped the
+/// handle here, a fast Stop→Record would spawn a second orchestrator while the first is still
+/// finishing, and the first task's trailing `RECORD_OFF` could land after the new `record_start`
+/// and kill the fresh recording. Keeping the handle lets `StartRecording`'s reap-if-finished check
+/// refuse to start until the stopping task is done — no overlap, no race.
 fn stop_recording(record_task: &mut Option<RecordTask>, bus: &Bus) {
-    if let Some(t) = record_task.take() {
+    if let Some(t) = record_task.as_ref() {
         t.stop.store(true, Ordering::Relaxed);
     }
     if let Ok(mut sh) = bus.shared.lock() {
