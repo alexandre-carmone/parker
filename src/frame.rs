@@ -12,8 +12,14 @@ use image::ImageFormat;
 pub struct Frame {
     pub width: usize,
     pub height: usize,
-    /// Tightly packed RGBA8, `width * height * 4` bytes.
+    /// Tightly packed RGBA8, `width * height * 4` bytes. For a 16-bit stream this holds the high
+    /// byte of each sample (a cheap 8-bit view); the full samples live in [`Frame::raw16`].
     pub rgba: Vec<u8>,
+    /// The original 16-bit mono samples (`width * height`), present only for a 16-bit raw stream.
+    /// Kept so the live-view stretch can scale against the true dynamic range — the high-byte
+    /// `rgba` alone is all-zero for anything below 256 ADU, so auto-stretch on faint frames would
+    /// otherwise show pure black. `None` for 8-bit and MJPEG frames (their `rgba` is already full).
+    pub raw16: Option<Vec<u16>>,
     /// Monotonic frame sequence number.
     pub seq: u64,
     /// Full-scale ADU of the source samples: 255 for an 8-bit stream (and MJPEG), 65535 for a
@@ -31,6 +37,7 @@ impl Frame {
             width,
             height,
             rgba,
+            raw16: None,
             seq,
             max_adu: 255,
             decoded_at: Instant::now(),
@@ -72,16 +79,20 @@ impl Frame {
         }
         let mut rgba = Vec::with_capacity(px * 4);
         let is_16bit = data.len() == px * 2;
+        let mut raw16: Option<Vec<u16>> = None;
         if data.len() == px {
             for &g in data {
                 rgba.extend_from_slice(&[g, g, g, 255]);
             }
         } else if is_16bit {
+            let mut samples = Vec::with_capacity(px);
             for s in data.chunks_exact(2) {
                 let g = u16::from_le_bytes([s[0], s[1]]);
                 let hi = (g >> 8) as u8;
                 rgba.extend_from_slice(&[hi, hi, hi, 255]);
+                samples.push(g);
             }
+            raw16 = Some(samples);
         } else {
             return Err(anyhow!(
                 "raw stream: {} bytes doesn't match {}×{} mono at 8 or 16 bit",
@@ -93,6 +104,7 @@ impl Frame {
         let mut frame = Frame::new(width, height, rgba, seq);
         if is_16bit {
             frame.max_adu = 65535;
+            frame.raw16 = raw16;
         }
         Ok(frame)
     }
@@ -116,6 +128,30 @@ impl Frame {
     /// `Color32` buffer). It is intentionally kept off the GUI thread — the worker calls it and
     /// publishes the result via [`crate::bus::Bus::publish_display`], so the UI only uploads.
     pub fn to_display_image(&self, auto: bool, gain: f32) -> ColorImage {
+        let size = [self.width, self.height];
+
+        // 16-bit stream: stretch against the true samples, not the high-byte `rgba` (which is
+        // all-zero below 256 ADU, so auto-stretch there would leave a faint frame black). Map each
+        // 16-bit sample to 8 bits via `gain` and, in auto mode, the frame's actual peak.
+        if let Some(raw16) = &self.raw16 {
+            let mut scale = gain.max(0.0) / 256.0; // 16-bit → 8-bit baseline (× gain)
+            if auto {
+                let max = raw16.iter().copied().max().unwrap_or(0);
+                if max > 0 {
+                    scale = gain.max(0.0) * 255.0 / max as f32;
+                }
+            }
+            let s = |v: u16| (v as f32 * scale).round().clamp(0.0, 255.0) as u8;
+            let pixels = raw16
+                .iter()
+                .map(|&v| {
+                    let g = s(v);
+                    Color32::from_rgba_unmultiplied(g, g, g, 255)
+                })
+                .collect();
+            return ColorImage::new(size, pixels);
+        }
+
         let mut scale = gain.max(0.0);
         if auto {
             let max = self
@@ -128,7 +164,6 @@ impl Frame {
                 scale *= 255.0 / max as f32;
             }
         }
-        let size = [self.width, self.height];
         // Fast path: nothing to stretch, convert straight to Color32.
         if (scale - 1.0).abs() < f32::EPSILON {
             return ColorImage::from_rgba_unmultiplied(size, &self.rgba);
@@ -201,9 +236,29 @@ mod tests {
 
     #[test]
     fn raw_stream_16bit_mono_uses_high_byte() {
-        // 1×1 16-bit LE mono: 0x1234 → high byte 0x12.
+        // 1×1 16-bit LE mono: 0x1234 → high byte 0x12, plus the full sample kept for stretching.
         let f = Frame::from_raw_stream(&[0x34, 0x12], 1, 1, 7).unwrap();
         assert_eq!(&f.rgba[0..4], &[0x12, 0x12, 0x12, 255]);
+        assert_eq!(f.raw16.as_deref(), Some(&[0x1234u16][..]));
+    }
+
+    #[test]
+    fn raw16_auto_stretch_reveals_faint_frame() {
+        // Two 16-bit samples both below 256 ADU: the high-byte rgba is all zero (would preview
+        // black), but auto-stretch against the true samples maps the peak (200) to 255.
+        let f = Frame::from_raw_stream(&[100, 0, 200, 0], 2, 1, 1).unwrap();
+        assert_eq!(&f.rgba[0..4], &[0, 0, 0, 255]); // high byte is zero
+        let img = f.to_display_image(true, 1.0);
+        assert_eq!(img.pixels[1].r(), 255); // brightest sample stretched to full
+        assert_eq!(img.pixels[0].r(), 128); // 100/200 * 255 ≈ 128
+    }
+
+    #[test]
+    fn raw16_manual_gain_matches_high_byte() {
+        // With auto off and unit gain, a 16-bit sample maps to its high byte (value / 256).
+        let f = Frame::from_raw_stream(&[0x34, 0x12], 1, 1, 1).unwrap();
+        let img = f.to_display_image(false, 1.0);
+        assert_eq!(img.pixels[0].r(), 0x12);
     }
 
     #[test]
