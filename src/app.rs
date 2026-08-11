@@ -837,6 +837,11 @@ fn fit_rect(container: egui::Rect, tex_size: egui::Vec2) -> egui::Rect {
 
 /// Clamp user-entered ROI numbers to the sensor and enforce a minimum size, in sensor pixels.
 fn clamp_roi(x: i64, y: i64, w: i64, h: i64, sensor_w: u32, sensor_h: u32) -> (u32, u32, u32, u32) {
+    // Guard against an unknown sensor size (0): the clamps below would form `clamp(1, 0)` and
+    // panic. Callers gate this on `sensor_w > 0` today, but don't rely on that here.
+    if sensor_w == 0 || sensor_h == 0 {
+        return (0, 0, 0, 0);
+    }
     let sw = sensor_w as i64;
     let sh = sensor_h as i64;
     let x = x.clamp(0, (sw - 1).max(0));

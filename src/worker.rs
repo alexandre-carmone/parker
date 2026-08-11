@@ -1301,7 +1301,10 @@ async fn dispatch(cmd: Command, s: &Session, bus: &Bus) -> Result<()> {
         Command::SetRoi { x, y, w, h } => set_roi(s, bus, x, y, w, h).await?,
         Command::ResetRoi => {
             let (w, h) = {
-                let sh = bus.shared.lock().unwrap();
+                let sh = bus
+                    .shared
+                    .lock()
+                    .map_err(|_| anyhow!("shared state lock poisoned"))?;
                 (sh.sensor_w, sh.sensor_h)
             };
             if w == 0 || h == 0 {

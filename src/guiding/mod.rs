@@ -75,8 +75,7 @@ async fn pulse_and_measure(
 /// `pulse_ms` is the per-move pulse duration. Detection must already be enabled by the caller.
 /// Best-effort returns the mount near its start.
 pub async fn run_calibration(mount: Mount, bus: Bus, ctx: egui::Context, pulse_ms: f32) {
-    {
-        let mut sh = bus.shared.lock().unwrap();
+    if let Ok(mut sh) = bus.shared.lock() {
         sh.calibrating = true;
     }
     bus.refresh_detect(); // ensure detection is running for the measurements
@@ -84,10 +83,9 @@ pub async fn run_calibration(mount: Mount, bus: Bus, ctx: egui::Context, pulse_m
     bus.log(format!("calibrating… ({pulse_ms:.0}ms pulses)"));
 
     let result = calibrate(&mount, &bus, pulse_ms).await;
-    {
+    if let Ok(mut sh) = bus.shared.lock() {
         // NOTE: use `sh.log` (not `bus.log`) here — we hold `shared` and the std `Mutex` is not
         // reentrant, so `bus.log` (which re-locks) would deadlock.
-        let mut sh = bus.shared.lock().unwrap();
         sh.calibrating = false;
         match result {
             Some(cal) => {
@@ -132,9 +130,14 @@ pub async fn run_guide_loop(mount: Mount, bus: Bus, ctx: egui::Context, stop: Ar
     // away. A lost target therefore pauses corrections until a fresh sample arrives.
     let mut last_seq = 0u64;
     while !stop.load(Ordering::Relaxed) {
-        let (params, lock, calib) = {
-            let sh = bus.shared.lock().unwrap();
-            (sh.guide_params, sh.lock_point, sh.guide_calib)
+        let Ok((params, lock, calib)) = bus
+            .shared
+            .lock()
+            .map(|sh| (sh.guide_params, sh.lock_point, sh.guide_calib))
+        else {
+            // Lock poisoned: back off a cadence and retry rather than panicking the guide task.
+            sleep(Duration::from_millis(500)).await;
+            continue;
         };
         sleep(Duration::from_millis(params.cadence_ms.max(50))).await;
         if stop.load(Ordering::Relaxed) {
