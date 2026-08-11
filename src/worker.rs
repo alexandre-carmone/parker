@@ -286,33 +286,43 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                 ctx.request_repaint();
             }
             other => {
-                // Safety: stopping the stream or changing the ROI invalidates the lock point /
-                // reference patch, so stop guiding before applying such a command. The same
-                // changes invalidate an in-progress recording's geometry, so stop it too.
-                if matches!(
+                // Safety: several commands disturb the stream that guiding/calibration and
+                // recording depend on, so tear those down first.
+                //
+                // Guiding/calibration is cancelled for anything that invalidates the lock point /
+                // reference patch or bounces the stream: a stream stop, an ROI/binning change, or a
+                // `SetExposure` (which on cameras with a separate streaming exposure restarts the
+                // stream to apply the new rate). Calibration must be cancelled too — it has
+                // `guide_loop == None` yet is actively pulsing the mount and measuring in the
+                // current geometry, so a change mid-run would pulse blind or build a matrix from
+                // mismatched frames. `stop_guiding` tears down both.
+                let disturbs_stream = matches!(
                     other,
                     Command::StopStream
                         | Command::SetRoi { .. }
                         | Command::ResetRoi
                         | Command::SetBinning { .. }
-                ) {
-                    // Cancel guiding AND calibration: a calibration run has `guide_loop == None`
-                    // but is actively pulsing the mount and measuring in the current geometry, so
-                    // a stream stop / ROI change mid-calibration would pulse blind and build a
-                    // matrix from mismatched frames. `stop_guiding` tears down both.
-                    if guide_loop.is_some() || calib_task.is_some() {
-                        let was_calibrating = guide_loop.is_none();
-                        stop_guiding(&mut guide_loop, &mut calib_task, &bus);
-                        if was_calibrating {
-                            bus.log("calibration stopped (frame changed)");
-                        } else {
-                            bus.log("guiding stopped (frame changed)");
-                        }
+                        | Command::SetExposure(_)
+                );
+                // Recording is driver-side and independent of the client stream, so it only needs
+                // to stop when the *readout geometry* actually changes — not on a bare stream stop
+                // or an exposure change.
+                let changes_geometry = matches!(
+                    other,
+                    Command::SetRoi { .. } | Command::ResetRoi | Command::SetBinning { .. }
+                );
+                if disturbs_stream && (guide_loop.is_some() || calib_task.is_some()) {
+                    let was_calibrating = guide_loop.is_none();
+                    stop_guiding(&mut guide_loop, &mut calib_task, &bus);
+                    if was_calibrating {
+                        bus.log("calibration stopped (frame changed)");
+                    } else {
+                        bus.log("guiding stopped (frame changed)");
                     }
-                    if record_task.is_some() {
-                        stop_recording(&mut record_task, &bus);
-                        bus.log("recording stopped (frame changed)");
-                    }
+                }
+                if changes_geometry && record_task.is_some() {
+                    stop_recording(&mut record_task, &bus);
+                    bus.log("recording stopped (frame changed)");
                 }
                 match &session {
                     Some(s) => {
