@@ -1058,6 +1058,15 @@ fn resolve_raw_geometry(bus: &Bus, len: usize) -> (usize, usize) {
     let (sw, sh) = bus.sensor_size();
     if matches(sw, sh) && (sw, sh) != (rw, rh) {
         bus.set_stream_geometry(sw, sh);
+        // The coordinate frame just moved: a guider's lock point / detected positions were
+        // measured in the old geometry, so keeping the lock would produce a spurious large error
+        // and slew the mount. Drop the lock so the guide loop pauses (it `continue`s without a
+        // lock) until the user re-locks in the new frame.
+        if let Ok(mut s) = bus.shared.lock() {
+            if s.lock_point.take().is_some() {
+                s.guide_err = None;
+            }
+        }
         bus.log(format!(
             "driver streamed full sensor {sw}×{sh}, not the requested ROI {rw}×{rh} — \
              showing full frame (this camera may not support subframing the live stream)"
