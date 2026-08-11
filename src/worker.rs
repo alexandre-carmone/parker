@@ -296,9 +296,18 @@ pub async fn run(mut rx: UnboundedReceiver<Command>, bus: Bus, ctx: egui::Contex
                         | Command::ResetRoi
                         | Command::SetBinning { .. }
                 ) {
-                    if guide_loop.is_some() {
+                    // Cancel guiding AND calibration: a calibration run has `guide_loop == None`
+                    // but is actively pulsing the mount and measuring in the current geometry, so
+                    // a stream stop / ROI change mid-calibration would pulse blind and build a
+                    // matrix from mismatched frames. `stop_guiding` tears down both.
+                    if guide_loop.is_some() || calib_task.is_some() {
+                        let was_calibrating = guide_loop.is_none();
                         stop_guiding(&mut guide_loop, &mut calib_task, &bus);
-                        bus.log("guiding stopped (frame changed)");
+                        if was_calibrating {
+                            bus.log("calibration stopped (frame changed)");
+                        } else {
+                            bus.log("guiding stopped (frame changed)");
+                        }
                     }
                     if record_task.is_some() {
                         stop_recording(&mut record_task, &bus);
