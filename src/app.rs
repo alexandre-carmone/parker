@@ -898,16 +898,24 @@ impl App {
     /// A 3×3 D-pad. Each of the 8 outer buttons starts a nudge on press and stops it on release;
     /// corners fire both cardinal axes for a diagonal slew. The center cell is a Stop button.
     fn nudge_pad(&mut self, ui: &mut egui::Ui) {
-        // Capture the two fields the handler needs separately so it borrows disjoint parts of
-        // `self` — this lets the center Stop button also touch `self.tx` between handler calls.
+        // Capture the fields the handler needs separately so it borrows disjoint parts of `self` —
+        // this lets the center Stop button also touch `self.tx` between handler calls.
         let tx = &self.tx;
         let nudge_down = &mut self.nudge_down;
-        let btn = |ui: &mut egui::Ui, label: &str| {
-            ui.add_sized([44.0, 32.0], egui::Button::new(label))
+        // Directional buttons sense *dragging*, not clicking. A plain click-sense button drops its
+        // held state once the press outlasts egui's `max_click_duration` (~0.8 s) — which reads as
+        // a release and stops the slew while the button is still physically held (this was the
+        // "slew stops after a few seconds" bug). Drag-sense keeps `is_pointer_button_down_on` true
+        // for as long as the button is down, so the mount slews until the user actually releases.
+        let dir_btn = |ui: &mut egui::Ui, label: &str| {
+            ui.add_sized(
+                [44.0, 32.0],
+                egui::Button::new(label).sense(egui::Sense::click_and_drag()),
+            )
         };
         let mut handle = |ui: &mut egui::Ui, idx: usize| {
             let (label, dirs) = NUDGE_BUTTONS[idx];
-            let down = btn(ui, label).is_pointer_button_down_on();
+            let down = dir_btn(ui, label).is_pointer_button_down_on();
             if down != nudge_down[idx] {
                 nudge_down[idx] = down;
                 for &dir in dirs {
@@ -924,7 +932,10 @@ impl App {
             });
             ui.horizontal(|ui| {
                 handle(ui, 3);
-                if btn(ui, "⏹").clicked() {
+                if ui
+                    .add_sized([44.0, 32.0], egui::Button::new("⏹"))
+                    .clicked()
+                {
                     let _ = tx.send(Command::Abort);
                 }
                 handle(ui, 4);
